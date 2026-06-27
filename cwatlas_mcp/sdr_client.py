@@ -66,9 +66,35 @@ class SdrClient:
 
     async def _open_authed(self, stream: str):
         ws = await websockets.connect(self._ws_url(stream), max_size=None)
+        # Verified on hw (2026.609): empty password is accepted on a private SDR with
+        # no user password set (server replies MSG badp=0).
         await ws.send(f"SET auth t={self.cfg.auth_type} p={self.cfg.password}")
-        # TODO[verify]: read/await the auth reply (MSG badp=...) before proceeding.
         return ws
+
+    async def read_config(self, stream: str = "W/F", timeout: float = 4.0) -> dict:
+        """Connect and collect the MSG config the server emits on connect.
+
+        Returns a flat dict including rx_chans, version_maj/min, center_freq,
+        bandwidth, adc_clk_nom. Use rx_chans from here at runtime — this unit
+        reports 12, not the marketed 13.
+        """
+        import asyncio
+
+        cfg: dict = {}
+        ws = await self._open_authed(stream)
+        try:
+            end = time.time() + timeout
+            while time.time() < end:
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=end - time.time())
+                except asyncio.TimeoutError:
+                    break
+                tag, payload = split_frame(raw)
+                if tag == "MSG":
+                    cfg.update(parse_msg(payload))
+        finally:
+            await ws.close()
+        return cfg
 
     # ---- Search plane: waterfall ----------------------------------------
     async def waterfall_stream(
@@ -79,13 +105,16 @@ class SdrClient:
         span ≈ ui_srate / 2^zoom; resolution ≈ span / 1024.
         """
         ws = await self._open_authed("W/F")
-        await ws.send(f"SET zoom={zoom} cf={center_hz:.0f}")   # cf in Hz [verify]
+        await ws.send(f"SET zoom={zoom} cf={center_hz:.0f}")   # cf in Hz (verified)
         await ws.send(f"SET wf_speed={fps}")
         await ws.send("SET maxdb=-10 mindb=-110")
         try:
             async for raw in ws:
-                # TODO[verify on hw]: decode WF binary frame -> 1024 magnitude bins.
-                yield _decode_wf_frame(raw, center_hz, zoom, self.cfg.ui_srate_hz)
+                tag, payload = split_frame(raw)
+                if tag == "W/F":
+                    # TODO[next]: decode W/F payload bytes -> 1024 magnitude bins (dB).
+                    yield _decode_wf_frame(payload, center_hz, zoom, self.cfg.ui_srate_hz)
+                # MSG/other tags carry config/keepalive; ignore here (see read_config()).
         finally:
             await ws.close()
 
@@ -135,8 +164,11 @@ class IqSession:
     async def frames(self) -> AsyncIterator[bytes]:
         try:
             async for raw in self.ws:
-                # TODO[verify on hw]: strip 'SND' framing/seq header, return complex IQ.
-                yield raw
+                tag, payload = split_frame(raw)
+                if tag == "SND":
+                    # TODO[next]: parse SND seq/flags header, return complex IQ samples.
+                    yield payload
+                # MSG frames carry keepalive/config; skip.
         finally:
             await self.ws.close()
 
@@ -144,7 +176,28 @@ class IqSession:
         await self.ws.close()
 
 
-# ---- parsing helpers (stubs) --------------------------------------------
+# ---- frame + parsing helpers --------------------------------------------
+def split_frame(raw) -> tuple[str, bytes]:
+    """KiwiSDR wraps every WS frame as a 3-byte ASCII tag + payload.
+
+    Tags seen on hw: 'MSG' (urlencoded key=val config/keepalive), 'W/F'
+    (waterfall), 'SND' (audio/IQ). Verified against firmware v2026.609.
+    """
+    b = raw if isinstance(raw, bytes) else raw.encode("latin1")
+    return b[:3].decode("latin1", "replace"), b[3:]
+
+
+def parse_msg(payload: bytes) -> dict:
+    """Parse a 'MSG' payload (space-separated, possibly urlencoded key=val) to a dict."""
+    from urllib.parse import unquote
+
+    out: dict = {}
+    for tok in payload.decode("latin1", "replace").split():
+        k, _, v = tok.partition("=")
+        out[k] = unquote(v)
+    return out
+
+
 def _parse_kv(text: str) -> dict:
     out: dict = {}
     for line in text.splitlines():

@@ -5,3 +5,4 @@ __pycache__/
 data/
 *.sigmf-*
 *.wav
+.codebase-memory/
