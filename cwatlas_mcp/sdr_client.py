@@ -110,10 +110,10 @@ class SdrClient:
         await ws.send("SET maxdb=-10 mindb=-110")
         try:
             async for raw in ws:
-                tag, payload = split_frame(raw)
-                if tag == "W/F":
-                    # TODO[next]: decode W/F payload bytes -> 1024 magnitude bins (dB).
-                    yield _decode_wf_frame(payload, center_hz, zoom, self.cfg.ui_srate_hz)
+                frame = raw if isinstance(raw, bytes) else raw.encode("latin1")
+                if frame[:3] == b"W/F":
+                    # _decode_wf_frame parses the full frame (header + bins).
+                    yield _decode_wf_frame(frame, center_hz, zoom, self.cfg.ui_srate_hz)
                 # MSG/other tags carry config/keepalive; ignore here (see read_config()).
         finally:
             await ws.close()
@@ -207,8 +207,29 @@ def _parse_kv(text: str) -> dict:
     return out
 
 
-def _decode_wf_frame(raw, center_hz, zoom, ui_srate_hz) -> WfFrame:
+def _decode_wf_frame(frame: bytes, center_hz, zoom, ui_srate_hz) -> WfFrame:
+    """Decode a full W/F frame (pass the whole frame incl. the 'W/F' tag).
+
+    Wire format (from firmware rx_waterfall.h `wf_pkt_t`, ARM little-endian):
+        [0:4]   id4          : b"W/F\\x00"
+        [4:8]   x_bin_server : u32  (start bin offset)
+        [8:12]  flags_x_zoom : u32  (zoom in low 16; flags in high 16;
+                                     compression bit = 0x00010000)
+        [12:16] seq          : u32
+        [16: ]  data         : zoom==0 OR comp off -> 1024 raw bytes (1/bin, dBm code)
+                               else -> IMA-ADPCM(u8,e8) of [10 pad + 1024], (10+1024)/2 B
+
+    NB: collector should run at zoom 0 (raw) for the wideband search map, OR
+    implement IMA-ADPCM decode for finer zoom. Verified format on firmware v2026.609.
+    """
+    import struct
+
     span = ui_srate_hz / (1 << zoom)
     bin_hz = span / 1024.0
-    # TODO[verify on hw]: real WF frame decode (compressed magnitude bytes -> dB).
-    return WfFrame(center_hz=center_hz, bin_hz=bin_hz, bins=[], ts=time.time())
+    flags_zoom = struct.unpack_from("<I", frame, 8)[0]
+    compressed = bool(flags_zoom & 0x00010000)
+    if not compressed and len(frame) >= 16 + 1024:
+        bins = list(frame[16:16 + 1024])  # raw dBm codes, 1 byte/bin
+    else:
+        bins = []  # TODO[M1]: IMA-ADPCM(u8,e8) decode -> skip 10 pad -> 1024 bins
+    return WfFrame(center_hz=center_hz, bin_hz=bin_hz, bins=bins, ts=time.time())
