@@ -65,7 +65,12 @@ class SdrClient:
         return f"ws://{self.cfg.host}:{self.cfg.port}/{ts}/{stream}"
 
     async def _open_authed(self, stream: str):
-        ws = await websockets.connect(self._ws_url(stream), max_size=None)
+        # ping_interval=None: the firmware doesn't answer WS-level pings, so the
+        # library would close the socket with "keepalive ping timeout" after ~40s.
+        # Liveness is app-level: send "SET keepalive" periodically instead.
+        ws = await websockets.connect(
+            self._ws_url(stream), max_size=None, ping_interval=None
+        )
         # Verified on hw (2026.609): empty password is accepted on a private SDR with
         # no user password set (server replies MSG badp=0).
         await ws.send(f"SET auth t={self.cfg.auth_type} p={self.cfg.password}")
@@ -105,9 +110,15 @@ class SdrClient:
         span ≈ ui_srate / 2^zoom; resolution ≈ span / 1024.
         """
         ws = await self._open_authed("W/F")
-        await ws.send(f"SET zoom={zoom} cf={center_hz:.0f}")   # cf in Hz (verified)
-        await ws.send(f"SET wf_speed={fps}")
-        await ws.send("SET maxdb=-10 mindb=-110")
+        # W/F streams only once cmd_recv == CMD_ALL = ZOOM|START|DB|SPEED
+        # (rx_waterfall.cpp:659) — omit maxdb/mindb and you get silence, no error.
+        # NB: cf is parsed in *kHz* by the firmware (`cf *= kHz`), not Hz.
+        await ws.send(f"SET zoom={zoom} cf={center_hz / 1e3:.3f}")  # -> ZOOM|START
+        await ws.send("SET maxdb=-10 mindb=-110")                   # -> DB
+        await ws.send(f"SET wf_speed={fps}")                        # -> SPEED
+        # raw (uncompressed) bins at ANY zoom — avoids IMA-ADPCM entirely
+        await ws.send("SET wf_comp=0")
+        await ws.send("SET keepalive")
         try:
             async for raw in ws:
                 frame = raw if isinstance(raw, bytes) else raw.encode("latin1")
@@ -124,13 +135,20 @@ class SdrClient:
     ) -> "IqSession":
         """Open a /SND session in IQ mode, narrowed to ±half_bw_hz around freq."""
         ws = await self._open_authed("SND")
-        freq_khz = freq_hz / 1000.0
+        # Audio streams only once cmd_recv == CMD_ALL = FREQ|MODE|PASSBAND|AGC|AR_OK
+        # (rx_sound_cmd.h) — hw-validated sequence:
+        # CW capture: tune 1 kHz low so the carrier sits at ~+1000 Hz in baseband
+        # (clear of DC); passband tracks the requested half-bandwidth around it.
+        freq_khz = (freq_hz - 1000.0) / 1000.0
+        lo, hi = 1000.0 - half_bw_hz, 1000.0 + half_bw_hz
         await ws.send(
-            f"SET mod=iq low_cut={-half_bw_hz:.0f} high_cut={half_bw_hz:.0f} "
-            f"freq={freq_khz:.3f} param=0"
-        )
+            f"SET mod=iq low_cut={lo:.0f} high_cut={hi:.0f} freq={freq_khz:.3f}"
+        )  # -> FREQ|MODE|PASSBAND
+        # AGC OFF (manual gain): agc=1 would normalize amplitude and erase the CW
+        # keying envelope — the very signal MorseBase trains on.
+        await ws.send("SET agc=0 hang=0 thresh=-130 slope=6 decay=1000 manGain=60")
+        await ws.send(f"SET AR OK in={self.cfg.snd_rate_hz} out={self.cfg.snd_rate_hz}")
         await ws.send("SET compression=0")
-        # TODO[verify]: audio-rate handshake, e.g. "SET AR OK in=12000 out=12000".
         await ws.send("SET keepalive")
         return IqSession(ws, freq_hz, self.cfg.snd_rate_hz)
 
@@ -147,9 +165,10 @@ class SdrClient:
 
 @dataclass
 class WfFrame:
-    center_hz: float
+    center_hz: float   # what we asked for (requested cf)
+    start_hz: float    # authoritative: from x_bin_server; freq(i) = start_hz + (i+.5)*bin_hz
     bin_hz: float
-    bins: list  # length 1024, magnitude (dB)
+    bins: list  # length 1024, dBm per bin
     ts: float
 
 
@@ -207,29 +226,37 @@ def _parse_kv(text: str) -> dict:
     return out
 
 
+MAX_ZOOM = 14
+
+
 def _decode_wf_frame(frame: bytes, center_hz, zoom, ui_srate_hz) -> WfFrame:
     """Decode a full W/F frame (pass the whole frame incl. the 'W/F' tag).
 
-    Wire format (from firmware rx_waterfall.h `wf_pkt_t`, ARM little-endian):
+    Wire format (from firmware rx_waterfall.h `wf_pkt_t`, ARM little-endian;
+    hw-validated 2026-07-01 on v2026.609):
         [0:4]   id4          : b"W/F\\x00"
-        [4:8]   x_bin_server : u32  (start bin offset)
+        [4:8]   x_bin_server : u32  start position in *MAX_ZOOM-bin units*
+                                    (HZperStart = ui_srate/(1024*2^MAX_ZOOM) ~ 3.66 Hz),
+                                    NOT current-zoom bins
         [8:12]  flags_x_zoom : u32  (zoom in low 16; flags in high 16;
                                      compression bit = 0x00010000)
         [12:16] seq          : u32
-        [16: ]  data         : zoom==0 OR comp off -> 1024 raw bytes (1/bin, dBm code)
-                               else -> IMA-ADPCM(u8,e8) of [10 pad + 1024], (10+1024)/2 B
+        [16: ]  data         : with `SET wf_comp=0` -> 1024 raw bytes, one per bin,
+                               dBm = byte - 255 (0..-200 dBm -> 255..55)
+                               else zoom!=0 -> IMA-ADPCM (don't: send wf_comp=0)
 
-    NB: collector should run at zoom 0 (raw) for the wideband search map, OR
-    implement IMA-ADPCM decode for finer zoom. Verified format on firmware v2026.609.
+    freq of bin i = start_hz + (i + 0.5) * bin_hz.
     """
     import struct
 
     span = ui_srate_hz / (1 << zoom)
     bin_hz = span / 1024.0
-    flags_zoom = struct.unpack_from("<I", frame, 8)[0]
+    hz_per_start = ui_srate_hz / (1024 * (1 << MAX_ZOOM))
+    x_bin, flags_zoom = struct.unpack_from("<II", frame, 4)
     compressed = bool(flags_zoom & 0x00010000)
     if not compressed and len(frame) >= 16 + 1024:
-        bins = list(frame[16:16 + 1024])  # raw dBm codes, 1 byte/bin
+        bins = [b - 255 for b in frame[16:16 + 1024]]  # dBm per bin
     else:
-        bins = []  # TODO[M1]: IMA-ADPCM(u8,e8) decode -> skip 10 pad -> 1024 bins
-    return WfFrame(center_hz=center_hz, bin_hz=bin_hz, bins=bins, ts=time.time())
+        bins = []  # compressed — collector always sends wf_comp=0, so shouldn't happen
+    return WfFrame(center_hz=center_hz, start_hz=x_bin * hz_per_start,
+                   bin_hz=bin_hz, bins=bins, ts=time.time())
