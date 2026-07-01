@@ -30,6 +30,12 @@ class SchedulerConfig:
     release_timeout_s: float = 150.0  # > scan revisit period, or captures ping-pong
     detection_stale_s: float = 240.0  # decay detections unseen this long
     keyed_conf_threshold: float = 0.5
+    # minimum weighted score to be assigned a channel AT ALL. With neutral
+    # band_priority (1.0) almost anything eligible passes (keyed 0.5 + 3 dB = 8);
+    # with solar weighting, closed-band junk is excluded even when channels are
+    # idle (day 160m at 0.2: needs keyed*10+SNR >= 40) instead of squatting on
+    # them for release_timeout_s. Signals must EARN a channel, not just exist.
+    min_capture_score: float = 8.0
     tick_s: float = 1.0
 
 
@@ -156,6 +162,8 @@ class Supervisor:
             # a detection too stale to keep a channel must not win a new one,
             # or release->reassign ping-pongs the same station across channels
             and d.age_s <= self.cfg.release_timeout_s
+            # and it must EARN the channel under current band weighting
+            and score(d) >= self.cfg.min_capture_score
         ]
         return sorted(cands, key=score, reverse=True)
 
