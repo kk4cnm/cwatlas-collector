@@ -30,11 +30,17 @@ class SdrConfig:
 
 
 class SdrClient:
+    OPEN_SPACING_S = 1.0   # pace WS opens: a burst of simultaneous connects gets
+                           # some dropped by the server even below rx_chans capacity
+                           # (hw-verified: 11 staggered conns fine, 9-at-once flaky)
+
     def __init__(self, cfg: SdrConfig):
         self.cfg = cfg
         self._http = httpx.AsyncClient(
             base_url=f"http://{cfg.host}:{cfg.port}", timeout=5.0
         )
+        self._open_lock: Optional["asyncio.Lock"] = None   # created lazily in-loop
+        self._last_open = 0.0
 
     # ---- AJAX info plane -------------------------------------------------
     async def get_status(self) -> dict:
@@ -65,12 +71,22 @@ class SdrClient:
         return f"ws://{self.cfg.host}:{self.cfg.port}/{ts}/{stream}"
 
     async def _open_authed(self, stream: str):
-        # ping_interval=None: the firmware doesn't answer WS-level pings, so the
-        # library would close the socket with "keepalive ping timeout" after ~40s.
-        # Liveness is app-level: send "SET keepalive" periodically instead.
-        ws = await websockets.connect(
-            self._ws_url(stream), max_size=None, ping_interval=None
-        )
+        import asyncio
+
+        # serialize + pace connection opens (see OPEN_SPACING_S)
+        if self._open_lock is None:
+            self._open_lock = asyncio.Lock()
+        async with self._open_lock:
+            wait = self._last_open + self.OPEN_SPACING_S - time.time()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            # ping_interval=None: the firmware doesn't answer WS-level pings, so
+            # the library would close the socket with "keepalive ping timeout"
+            # ~40s in. Liveness is app-level: send "SET keepalive" periodically.
+            ws = await websockets.connect(
+                self._ws_url(stream), max_size=None, ping_interval=None
+            )
+            self._last_open = time.time()
         # Verified on hw (2026.609): empty password is accepted on a private SDR with
         # no user password set (server replies MSG badp=0).
         await ws.send(f"SET auth t={self.cfg.auth_type} p={self.cfg.password}")
@@ -129,6 +145,57 @@ class SdrClient:
         finally:
             await ws.close()
 
+    async def waterfall_scan(
+        self, plan: list[tuple[str, float]], zoom: int = 10,
+        frames_per_dwell: int = 40, fps: int = 4,
+        dwell_timeout_s: float = 15.0, reconnect_backoff_s: float = 65.0,
+    ) -> AsyncIterator[tuple[str, float, list["WfFrame"]]]:
+        """Cycle forever over `plan` [(band, center_hz)] on ONE pooled /W/F
+        connection, retuning in place. Yields (band, center_hz, frames) per dwell.
+
+        This is THE search-plane entry point: never open a connection per dwell —
+        channel holds linger ~1 min after close and starve the device. On socket
+        loss, waits `reconnect_backoff_s` (letting the server-side hold expire)
+        and reconnects.
+        """
+        import asyncio
+
+        span = self.cfg.ui_srate_hz / (1 << zoom)
+        while True:
+            try:
+                ws = await self._open_authed("W/F")
+                await ws.send("SET maxdb=-10 mindb=-110")   # -> CMD_DB (mandatory)
+                await ws.send(f"SET wf_speed={fps}")        # -> CMD_SPEED
+                await ws.send("SET wf_comp=0")              # raw bins at any zoom
+                while True:
+                    for band, center_hz in plan:
+                        await ws.send(f"SET zoom={zoom} cf={center_hz / 1e3:.3f}")
+                        await ws.send("SET keepalive")
+                        want_start = center_hz - span / 2
+                        frames: list[WfFrame] = []
+                        deadline = time.time() + dwell_timeout_s
+                        while len(frames) < frames_per_dwell and time.time() < deadline:
+                            try:
+                                raw = await asyncio.wait_for(
+                                    ws.recv(), timeout=deadline - time.time())
+                            except asyncio.TimeoutError:
+                                break
+                            b = raw if isinstance(raw, bytes) else raw.encode("latin1")
+                            if b[:3] != b"W/F":
+                                continue
+                            f = _decode_wf_frame(b, center_hz, zoom, self.cfg.ui_srate_hz)
+                            # skip frames still carrying the previous tune position
+                            if not f.bins or abs(f.start_hz - want_start) > span / 4:
+                                continue
+                            frames.append(f)
+                        yield band, center_hz, frames
+            except (websockets.WebSocketException, OSError) as exc:
+                # socket loss / server restart — wait out the server-side channel
+                # hold (~1 min) before reconnecting, or we'd starve the device
+                print(f"[sdr] W/F scan connection lost ({exc!r}); "
+                      f"reconnecting in {reconnect_backoff_s:.0f}s")
+                await asyncio.sleep(reconnect_backoff_s)
+
     # ---- Capture plane: IQ sound ----------------------------------------
     async def capture_iq(
         self, freq_hz: float, half_bw_hz: float = 200.0
@@ -150,7 +217,7 @@ class SdrClient:
         await ws.send(f"SET AR OK in={self.cfg.snd_rate_hz} out={self.cfg.snd_rate_hz}")
         await ws.send("SET compression=0")
         await ws.send("SET keepalive")
-        return IqSession(ws, freq_hz, self.cfg.snd_rate_hz)
+        return IqSession(ws, freq_hz, self.cfg.snd_rate_hz, low_cut=lo, high_cut=hi)
 
     async def set_antenna(self, n: int) -> None:
         """ant_switch EXT: n=0 grounds all inputs. SECONDARY, not the TX interlock."""
@@ -172,24 +239,79 @@ class WfFrame:
     ts: float
 
 
-class IqSession:
-    """Holds an open /SND IQ WebSocket. Iterate frames; caller writes them to disk."""
+@dataclass
+class IqChunk:
+    """One SND/IQ frame: raw interleaved int16-LE I,Q plus header metadata.
 
-    def __init__(self, ws, freq_hz: float, srate_hz: int):
+    Wire format (firmware rx_sound.h snd_pkt_iq_t, hw-validated): 20-byte header
+    = id[3] + flags(1) + seq(u4 LE) + smeter(u2 BE) + last_gps_solution(1) +
+    dummy(1) + gpssec(u4 LE) + gpsnsec(u4 LE), then int16-LE I,Q pairs.
+    IQ mode is UNCOMPRESSED. gpssec/gpsnsec = GPS-disciplined capture timestamp.
+    """
+    data: bytes        # interleaved int16-LE I,Q — append directly to .sigmf-data
+    seq: int
+    smeter: int        # raw big-endian u16
+    gps_solution: int
+    gpssec: int
+    gpsnsec: int
+
+    @property
+    def n_samples(self) -> int:
+        return len(self.data) // 4
+
+
+class IqSession:
+    """Holds an open /SND IQ WebSocket. Iterate chunks; caller writes them to disk.
+
+    LIVES LONG: channel workers keep one session open for the process lifetime and
+    retune() in place — opening/closing /SND per capture starves the device (each
+    closed connection's channel is held ~1 min server-side).
+    """
+
+    def __init__(self, ws, freq_hz: float, srate_hz: int,
+                 low_cut: float = 750.0, high_cut: float = 1250.0):
         self.ws = ws
         self.freq_hz = freq_hz
         self.srate_hz = srate_hz
+        self.low_cut = low_cut
+        self.high_cut = high_cut
 
-    async def frames(self) -> AsyncIterator[bytes]:
-        try:
-            async for raw in self.ws:
-                tag, payload = split_frame(raw)
-                if tag == "SND":
-                    # TODO[next]: parse SND seq/flags header, return complex IQ samples.
-                    yield payload
-                # MSG frames carry keepalive/config; skip.
-        finally:
-            await self.ws.close()
+    async def retune(self, freq_hz: float) -> None:
+        """Move this channel to a new signal without touching the connection.
+
+        NB: the firmware has ONE tune command format (rx_sound_cmd.cpp) — the full
+        mod/low_cut/high_cut/freq line; a bare "SET freq=" is silently ignored.
+        Keeps the CW convention: tune 1 kHz low -> carrier at ~+1 kHz baseband."""
+        await self.ws.send(
+            f"SET mod=iq low_cut={self.low_cut:.0f} high_cut={self.high_cut:.0f} "
+            f"freq={(freq_hz - 1000.0) / 1000.0:.3f}"
+        )
+        await self.ws.send("SET keepalive")
+        self.freq_hz = freq_hz
+
+    async def next_chunk(self) -> IqChunk:
+        """Await the next SND/IQ chunk (skipping MSG frames).
+
+        Cancel-safe: wrap in asyncio.wait_for freely — websockets' recv() supports
+        cancellation cleanly. (Do NOT reintroduce an async-generator here: a
+        wait_for timeout cancels __anext__ mid-recv, runs the generator's finally,
+        and silently closes the session. Cost us a whole trial to find.)
+        Raises ConnectionClosed when the socket dies.
+        """
+        import struct
+
+        while True:
+            raw = await self.ws.recv()
+            tag, payload = split_frame(raw)
+            if tag != "SND":
+                continue  # MSG frames carry keepalive/config; skip
+            # payload is the frame minus the 3-byte tag -> header remainder = 17 B
+            seq = struct.unpack_from("<I", payload, 1)[0]
+            smeter = struct.unpack_from(">H", payload, 5)[0]
+            gps_sol = payload[7]
+            gpssec, gpsnsec = struct.unpack_from("<II", payload, 9)
+            return IqChunk(data=payload[17:], seq=seq, smeter=smeter,
+                           gps_solution=gps_sol, gpssec=gpssec, gpsnsec=gpsnsec)
 
     async def close(self) -> None:
         await self.ws.close()

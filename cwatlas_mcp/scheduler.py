@@ -12,18 +12,23 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 from .models import ChannelMode, ChannelState, Detection, Nudge, TxEvent
 
 
 @dataclass
 class SchedulerConfig:
-    n_rx_channels: int = 13           # [verify on hw]
+    """NB on time constants: detections only refresh when the single pooled
+    scanner revisits that band — a full cycle over 9 watering holes is ~90-120 s.
+    Timeouts SHORTER than the revisit period cause release/reassign ping-pong
+    (observed in the first live trial: 154 rows in 3 min, most 0-sample)."""
+
+    n_rx_channels: int = 12           # authoritative count read from hw at startup
     deep_dwell_reserve: int = 2       # channels held for weak/speculative captures
-    min_dwell_s: float = 8.0          # don't thrash a channel off a real QSO
-    release_timeout_s: float = 12.0   # CW QSOs have gaps; tune so we don't drop mid-QSO
-    detection_stale_s: float = 30.0   # decay detections unseen this long
+    min_dwell_s: float = 20.0         # don't thrash a channel off a real QSO
+    release_timeout_s: float = 150.0  # > scan revisit period, or captures ping-pong
+    detection_stale_s: float = 240.0  # decay detections unseen this long
     keyed_conf_threshold: float = 0.5
     tick_s: float = 1.0
 
@@ -60,10 +65,15 @@ class CollectorState:
 
 
 class Supervisor:
-    def __init__(self, cfg: SchedulerConfig, state: CollectorState, bus: ControlBus):
+    def __init__(self, cfg: SchedulerConfig, state: CollectorState, bus: ControlBus,
+                 spawn_capture: Optional[Callable[[int, Detection], None]] = None,
+                 stop_capture: Optional[Callable[[int], None]] = None):
         self.cfg = cfg
         self.state = state
         self.bus = bus
+        # runtime wires these to real capture-worker task management; None in tests
+        self.spawn_capture = spawn_capture
+        self.stop_capture = stop_capture
         for ch in range(cfg.n_rx_channels):
             state.channels[ch] = ChannelState(ch=ch)
 
@@ -77,6 +87,8 @@ class Supervisor:
                 print(f"[supervisor] tick error: {exc}")
             await asyncio.sleep(self.cfg.tick_s)
 
+    _n_ticks = 0
+
     def tick(self) -> None:
         self._decay_activity()
         self._apply_nudges(self.bus.drain())
@@ -85,16 +97,29 @@ class Supervisor:
             return
         desired = self._score_candidates()
         self._reconcile(desired)
-        # TODO: persist channel_state + capture rows to the catalog DB here.
+        self._n_ticks += 1
+        if self._n_ticks % 30 == 0:   # periodic health line (~every 30s)
+            modes = [c.mode.value[:3] for c in self.state.channels.values()]
+            print(f"[supervisor] tick={self._n_ticks} ch=[{' '.join(modes)}] "
+                  f"activity={len(self.state.activity)} eligible={len(desired)}")
 
     # ---- ingest from search workers -------------------------------------
+    MERGE_TOLERANCE_HZ = 120.0  # ~2 waterfall bins: same station, slight drift
+
     def observe(self, det: Detection) -> None:
         """Called by search workers when a detection appears/updates."""
-        existing = self.state.activity.get(det.freq_hz)
+        existing = None
+        for f, d in self.state.activity.items():
+            if abs(f - det.freq_hz) <= self.MERGE_TOLERANCE_HZ:
+                existing = d
+                break
         if existing:
             existing.last_seen = det.last_seen
             existing.strength_db = det.strength_db
-            existing.keyed_confidence = det.keyed_confidence
+            # keep the best keying evidence seen recently (one quiet dwell
+            # shouldn't demote a station mid-QSO; staleness decay handles exits)
+            existing.keyed_confidence = max(existing.keyed_confidence,
+                                            det.keyed_confidence)
         else:
             self.state.activity[det.freq_hz] = det
 
@@ -128,6 +153,9 @@ class Supervisor:
         cands = [
             d for d in self.state.activity.values()
             if d.keyed_confidence >= self.cfg.keyed_conf_threshold
+            # a detection too stale to keep a channel must not win a new one,
+            # or release->reassign ping-pongs the same station across channels
+            and d.age_s <= self.cfg.release_timeout_s
         ]
         return sorted(cands, key=score, reverse=True)
 
@@ -169,15 +197,17 @@ class Supervisor:
         cs.freq_hz = det.freq_hz
         cs.since = time.time()
         cs.contaminated = False
-        # TODO: spawn a capture worker -> SdrClient.capture_iq(det.freq_hz)
+        if self.spawn_capture:
+            self.spawn_capture(ch, det)   # runtime starts a capture_worker task
 
     def _release(self, ch: int) -> None:
+        if self.stop_capture:
+            self.stop_capture(ch)         # cancels the worker; it finalizes files/row
         cs = self.state.channels[ch]
         cs.mode = ChannelMode.IDLE
         cs.freq_hz = None
         cs.since = time.time()
         cs.capture_id = None
-        # TODO: stop the capture worker, finalize the catalog row.
 
     def _set_mode(self, ch: int, mode: ChannelMode) -> None:
         cs = self.state.channels[ch]
