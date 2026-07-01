@@ -50,6 +50,28 @@ async def scan_worker(sdr: SdrClient, sup: Supervisor) -> None:
                 sup.observe(det)
 
 
+async def solar_worker(sup: Supervisor, lat: float, lon: float,
+                       every_s: float = 300.0) -> None:
+    """Refresh band_priority from solar elevation (HF propagation follows the sun).
+
+    Biases capture assignment toward bands that are actually open (high bands by
+    day, low bands after dark, gray-line boost at twilight) — cuts false-positive
+    captures on closed bands. NB: writes the same band_priority dict agent nudges
+    use; M4 must reconcile (e.g. nudges as multipliers on the solar baseline).
+    """
+    from .solar import band_weights
+
+    last_phase = None
+    while True:
+        phase, weights = band_weights(lat, lon)
+        sup.state.band_priority.update(weights)
+        if phase != last_phase:
+            print(f"[solar] phase={phase} at ({lat:.2f},{lon:.2f}); "
+                  f"weights: " + " ".join(f"{b}={w:.1f}" for b, w in weights.items()))
+            last_phase = phase
+        await asyncio.sleep(every_s)
+
+
 async def ptt_worker(sup: Supervisor) -> None:
     """Operator TX state (Flex amp-key via GPIO/serial or SmartSDR CAT) -> sup.set_tx().
 
@@ -104,6 +126,10 @@ async def main() -> None:
                                                 "~/cwatlas/data")).expanduser())
     ap.add_argument("--trial", type=float, default=0.0,
                     help="run N seconds then exit (skips the MCP server)")
+    ap.add_argument("--lat", type=float,
+                    default=float(os.environ.get("CWATLAS_LAT", "nan")))
+    ap.add_argument("--lon", type=float,
+                    default=float(os.environ.get("CWATLAS_LON", "nan")))
     args = ap.parse_args()
 
     sdr = SdrClient(SdrConfig(host=args.host, port=args.port))
@@ -131,6 +157,12 @@ async def main() -> None:
         asyncio.create_task(scan_worker(sdr, sup), name="scanner"),
         asyncio.create_task(ptt_worker(sup), name="ptt"),
     ]
+    if args.lat == args.lat and args.lon == args.lon:  # NaN-safe "both set"
+        tasks.append(asyncio.create_task(
+            solar_worker(sup, args.lat, args.lon), name="solar"))
+    else:
+        print("[runtime] no --lat/--lon (or CWATLAS_LAT/LON): "
+              "solar band weighting disabled, neutral priorities")
     if not args.trial:
         from . import server
         server.attach(state, bus, sdr)
