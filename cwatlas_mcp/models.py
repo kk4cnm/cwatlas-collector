@@ -28,6 +28,8 @@ class Detection:
     keyed_confidence: float        # [0,1]; is this actually keyed CW?
     first_seen: float = field(default_factory=time.time)
     last_seen: float = field(default_factory=time.time)
+    cooldown_until: float = 0.0    # after a max-dwell force-release: can't win
+                                   # a channel again until this passes
 
     @property
     def age_s(self) -> float:

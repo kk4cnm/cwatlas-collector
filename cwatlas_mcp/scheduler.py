@@ -36,6 +36,12 @@ class SchedulerConfig:
     # idle (day 160m at 0.2: needs keyed*10+SNR >= 40) instead of squatting on
     # them for release_timeout_s. Signals must EARN a channel, not just exist.
     min_capture_score: float = 8.0
+    # channel-hog guard: busy frequencies never go stale (fresh detections every
+    # scan cycle), so without a cap one 14 dB signal can hold a channel for
+    # hours (observed: 265 min in the first overnight soak). Force the slot back
+    # into competition; the cooldown stops the same signal instantly re-winning.
+    max_dwell_s: float = 1800.0
+    capture_cooldown_s: float = 180.0
     tick_s: float = 1.0
 
 
@@ -164,16 +170,27 @@ class Supervisor:
             and d.age_s <= self.cfg.release_timeout_s
             # and it must EARN the channel under current band weighting
             and score(d) >= self.cfg.min_capture_score
+            # and not be serving a max-dwell cooldown
+            and time.time() >= d.cooldown_until
         ]
         return sorted(cands, key=score, reverse=True)
 
     def _reconcile(self, desired: list[Detection]) -> None:
-        # 1. release idle/stale channels (respecting min dwell)
+        # 1. release stale channels (respecting min dwell) and max-dwell hogs
         for ch in self.state.channels.values():
             if ch.mode == ChannelMode.CAPTURING and ch.freq_hz is not None:
                 det = self.state.activity.get(ch.freq_hz)
                 stale = det is None or det.age_s > self.cfg.release_timeout_s
                 if stale and ch.dwell_s > self.cfg.min_dwell_s:
+                    self._release(ch.ch)
+                elif ch.dwell_s > self.cfg.max_dwell_s:
+                    # hog guard: back into competition + cooldown so the same
+                    # signal doesn't instantly re-win the freed slot
+                    if det is not None:
+                        det.cooldown_until = (time.time()
+                                              + self.cfg.capture_cooldown_s)
+                    print(f"[supervisor] ch{ch.ch} max-dwell release "
+                          f"{ch.freq_hz/1e3:.2f} kHz after {ch.dwell_s/60:.0f} min")
                     self._release(ch.ch)
 
         # 2. assign idle channels to top unserved candidates

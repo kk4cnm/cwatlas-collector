@@ -92,14 +92,15 @@ class ChannelPool:
     """
 
     def __init__(self, sdr: SdrClient, state: CollectorState,
-                 catalog: Catalog, data_dir: Path):
+                 catalog: Catalog, data_dir: Path, rotate_s: float):
         self.inboxes: dict[int, asyncio.Queue] = {}
         self.tasks: dict[int, asyncio.Task] = {}
         for ch, cs in state.channels.items():
             inbox: asyncio.Queue = asyncio.Queue()
             self.inboxes[ch] = inbox
             self.tasks[ch] = asyncio.create_task(
-                channel_worker(sdr, cs, inbox, catalog, data_dir),
+                channel_worker(sdr, cs, inbox, catalog, data_dir,
+                               rotate_s=rotate_s),
                 name=f"capture-ch{ch}")
 
     def spawn(self, ch: int, det: Detection) -> None:
@@ -130,6 +131,8 @@ async def main() -> None:
                     default=float(os.environ.get("CWATLAS_LAT", "nan")))
     ap.add_argument("--lon", type=float,
                     default=float(os.environ.get("CWATLAS_LON", "nan")))
+    ap.add_argument("--rotate-s", type=float, default=600.0,
+                    help="max seconds per capture file segment")
     args = ap.parse_args()
 
     sdr = SdrClient(SdrConfig(host=args.host, port=args.port))
@@ -148,7 +151,7 @@ async def main() -> None:
     # Supervisor must exist before the pool (it populates state.channels), but the
     # pool must exist before ticks assign — construct in this order:
     sup = Supervisor(cfg, state, bus)
-    pool = ChannelPool(sdr, state, catalog, args.data_dir)
+    pool = ChannelPool(sdr, state, catalog, args.data_dir, rotate_s=args.rotate_s)
     sup.spawn_capture = pool.spawn
     sup.stop_capture = pool.stop
 

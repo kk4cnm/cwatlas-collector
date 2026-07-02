@@ -24,11 +24,13 @@ import time
 from pathlib import Path
 
 from .catalog import Catalog
+from .dsp import CARRIER_OUT_HZ, FS_OUT, CwDecimator
 from .models import ChannelMode, ChannelState, Detection
 from .sdr_client import IqSession, SdrClient
 
 SHUTDOWN = object()          # inbox sentinel: exit the worker
 KEEPALIVE_EVERY_S = 10.0     # app-level liveness (firmware ignores WS pings)
+ROTATE_S = 600.0             # cap file segments at ~10 min; capture continues
 
 
 def _sigmf_meta(det: Detection, srate_hz: int, started_utc: float,
@@ -38,19 +40,23 @@ def _sigmf_meta(det: Detection, srate_hz: int, started_utc: float,
             "core:datatype": "ci16_le",
             "core:sample_rate": srate_hz,
             "core:version": "1.0.0",
-            "core:description": "CWAtlas raw CW capture (Web-888, AGC off, "
-                                "carrier offset-tuned to ~+1 kHz baseband)",
+            "core:description": "CWAtlas CW capture (Web-888, AGC off; device "
+                                "passband 750-1250 Hz shifted -750 Hz and "
+                                "decimated 12k->1.5k on capture; CW carrier at "
+                                f"~+{CARRIER_OUT_HZ:.0f} Hz baseband)",
             "core:recorder": "cwatlas-collector",
             "cwatlas:band": det.band,
             "cwatlas:strength_db": det.strength_db,
             "cwatlas:keyed_confidence": det.keyed_confidence,
             "cwatlas:contaminated": contaminated,
             "cwatlas:gps_start_sec": gpssec,
+            "cwatlas:carrier_offset_hz": CARRIER_OUT_HZ,
+            "cwatlas:decimated_from_hz": 12000,
         },
         "captures": [{
             "core:sample_start": 0,
-            # tuned 1 kHz below the signal: baseband +1000 Hz = det.freq_hz
-            "core:frequency": det.freq_hz - 1000.0,
+            # baseband 0 Hz corresponds to this RF; carrier at +CARRIER_OUT_HZ
+            "core:frequency": det.freq_hz - CARRIER_OUT_HZ,
             "core:datetime": time.strftime(
                 "%Y-%m-%dT%H:%M:%SZ", time.gmtime(started_utc)),
         }],
@@ -66,12 +72,15 @@ def _sigmf_meta(det: Detection, srate_hz: int, started_utc: float,
 
 async def _write_capture(session: IqSession, cs: ChannelState,
                          det: Detection, catalog: Catalog, data_dir: Path,
-                         inbox: asyncio.Queue, stall_s: float):
-    """Write one capture file until the inbox interrupts or the stream stalls.
+                         inbox: asyncio.Queue, stall_s: float,
+                         rotate_s: float = ROTATE_S):
+    """Write one capture file until interrupted, stalled, or rotate_s elapses.
 
-    Returns (interrupting command, stalled: bool). Command is Detection | None |
-    SHUTDOWN. Always finalizes its file and catalog row. ConnectionClosed
-    propagates to the worker (which reopens the session).
+    Returns (interrupting command, reason) with reason in "inbox" | "stall" |
+    "rotate". Command is Detection | None | SHUTDOWN (only for "inbox").
+    Always finalizes its file and catalog row. ConnectionClosed propagates to
+    the worker (which reopens the session). IQ is decimated 12k -> 1.5k inline
+    (see dsp.py) — the wire is 12 kHz but the disk doesn't have to be.
     """
     started = time.time()
     name = (f"{det.band}_{det.freq_hz/1e3:.2f}kHz_"
@@ -81,16 +90,17 @@ async def _write_capture(session: IqSession, cs: ChannelState,
     base = day_dir / name
 
     cap_id = catalog.start_capture(
-        freq_hz=det.freq_hz, band=det.band, srate_hz=session.srate_hz,
+        freq_hz=det.freq_hz, band=det.band, srate_hz=FS_OUT,
         path=str(base), strength_db=det.strength_db,
         keyed_conf=det.keyed_confidence)
     cs.capture_id = cap_id
 
+    dec = CwDecimator()                # fresh filter state per file
     n_samples, smeter_sum, smeter_n = 0, 0, 0
     gps_first: tuple[int, int] | None = None
     contaminated = False
     nxt = None
-    stalled = False
+    reason = "inbox"
     last_ka = time.time()
     try:
         with open(f"{base}.sigmf-data", "wb") as fd:
@@ -100,14 +110,18 @@ async def _write_capture(session: IqSession, cs: ChannelState,
                     break
                 except asyncio.QueueEmpty:
                     pass
+                if time.time() - started >= rotate_s:
+                    reason = "rotate"          # cap segment length; keep capturing
+                    break
                 try:
                     chunk = await asyncio.wait_for(session.next_chunk(),
                                                    timeout=stall_s)
                 except asyncio.TimeoutError:
-                    stalled = True             # no IQ for stall_s -> finalize
+                    reason = "stall"           # no IQ for stall_s -> finalize
                     break
-                fd.write(chunk.data)
-                n_samples += chunk.n_samples
+                out = dec.process(chunk.data)
+                fd.write(out)
+                n_samples += len(out) // 4
                 smeter_sum += chunk.smeter
                 smeter_n += 1
                 if gps_first is None and chunk.gps_solution:
@@ -120,7 +134,7 @@ async def _write_capture(session: IqSession, cs: ChannelState,
                     await session.ws.send("SET keepalive")
                     last_ka = time.time()
     finally:
-        meta = _sigmf_meta(det, session.srate_hz, started,
+        meta = _sigmf_meta(det, FS_OUT, started,
                            gps_first[0] if gps_first else None,
                            contaminated, n_samples)
         with open(f"{base}.sigmf-meta", "w") as fm:
@@ -130,15 +144,16 @@ async def _write_capture(session: IqSession, cs: ChannelState,
             smeter_avg=(smeter_sum / smeter_n) if smeter_n else None)
         cs.capture_id = None
         print(f"[capture ch{cs.ch}] {name}: {n_samples} samples "
-              f"({n_samples / session.srate_hz:.1f}s)"
-              f"{' STALLED' if stalled else ''}"
+              f"({n_samples / FS_OUT:.1f}s @{FS_OUT}Hz)"
+              f"{' STALLED' if reason == 'stall' else ''}"
+              f"{' ->rotate' if reason == 'rotate' else ''}"
               f"{' CONTAMINATED' if contaminated else ''}")
-    return nxt, stalled
+    return nxt, reason
 
 
 async def channel_worker(sdr: SdrClient, cs: ChannelState, inbox: asyncio.Queue,
                          catalog: Catalog, data_dir: Path,
-                         stall_s: float = 20.0) -> None:
+                         stall_s: float = 20.0, rotate_s: float = ROTATE_S) -> None:
     """Own one RX channel slot for the process lifetime."""
     session: IqSession | None = None
     cmd: object = None
@@ -186,8 +201,9 @@ async def channel_worker(sdr: SdrClient, cs: ChannelState, inbox: asyncio.Queue,
 
             # ---- capture until interrupted -------------------------------
             try:
-                cmd, stalled = await _write_capture(session, cs, det, catalog,
-                                                    data_dir, inbox, stall_s)
+                cmd, reason = await _write_capture(session, cs, det, catalog,
+                                                   data_dir, inbox, stall_s,
+                                                   rotate_s)
             except Exception as exc:           # ConnectionClosed mid-capture etc.
                 backoff = 65 + cs.ch * 7       # decorrelate retries across workers
                 print(f"[capture ch{cs.ch}] stream error ({exc!r}); "
@@ -197,7 +213,9 @@ async def channel_worker(sdr: SdrClient, cs: ChannelState, inbox: asyncio.Queue,
                 cmd = None
                 await asyncio.sleep(backoff)
                 continue
-            if cmd is None and stalled:
+            if reason == "rotate":
+                cmd = det       # same assignment, next file segment (no retune)
+            elif cmd is None and reason == "stall":
                 # worker-initiated stop: free the slot ONLY if the supervisor
                 # hasn't already retasked it (never clobber a fresh assignment —
                 # doing so caused double-assign churn in trial 2)
