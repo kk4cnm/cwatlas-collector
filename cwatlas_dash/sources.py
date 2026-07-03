@@ -228,3 +228,16 @@ def journal_tail(unit: str = "cwatlas-collector", n: int = 100,
     lines = proc.stdout.splitlines()
     return {"lines": lines,
             "errors": sum(1 for ln in lines if _ERROR_PAT.search(ln))}
+
+
+# ================================ solar =======================================
+def solar_priorities(lat: float, lon: float) -> dict:
+    """Recomputed solar baseline (same math the collector's solar_worker runs).
+
+    Live agent nudges are supervisor in-process state — unreachable without
+    MCP — so nudges is always None here; the UI says so rather than showing 1.0."""
+    from cwatlas_mcp.solar import band_weights
+
+    phase, weights = band_weights(lat, lon)
+    return {"phase": phase, "weights": weights, "nudges": None,
+            "note": "solar baseline only; live nudges require MCP"}
