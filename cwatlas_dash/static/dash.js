@@ -31,7 +31,7 @@ function renderStatus(el, svc, sdr, adc, totals) {
     <div class="item"><b>adc overload</b> <span class="${ovCls}">${esc(ov)}</span></div>
     <div class="item"><b>in flight</b> ${failed(totals) ? "?" : totals.in_flight}</div>
     <div class="item"><b>disk (${esc(d.path ?? "?")})</b>
-      ${d.free ? gb(d.free) : "?"} free (${freePct}%)</div>`;
+      ${d.free != null ? gb(d.free) : "?"} free (${freePct}%)</div>`;
 }
 
 const card = (title, big, sub = "") =>

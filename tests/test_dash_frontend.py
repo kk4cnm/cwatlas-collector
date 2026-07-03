@@ -16,6 +16,8 @@ def test_index_has_all_panels_and_no_cdn(client):
     for pid in PANEL_IDS:
         assert f'id="{pid}"' in html, f"missing {pid}"
     assert "https://" not in html          # no CDN/external assets
+    assert "http://" not in html
+    assert 'src="//' not in html and 'href="//' not in html  # no protocol-relative
     assert "dash.js" in html and "dash.css" in html
 
 
