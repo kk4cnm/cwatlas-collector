@@ -19,8 +19,9 @@ function renderStatus(el, svc, sdr, adc, totals) {
   const sdrHtml = failed(sdr)
     ? `<span class="bad">unreachable</span>`
     : `<span class="ok">ok</span> <span class="sub">gps ${esc(sdr.gps ?? "?")}</span>`;
-  const ov = failed(adc) ? "?" : adc.ov_mask;
-  const ovCls = ov === "0" ? "ok" : "bad";
+  // /status carries adc_ov on this firmware; /adc parses empty (JSON body vs key=value parser).
+  const ov = failed(adc) ? "?" : (adc.ov_mask ?? sdr.adc_ov ?? "?");
+  const ovCls = ov === "0" ? "ok" : ov === "?" ? "warn" : "bad";
   const d = svc.disk || {};
   const freePct = d.total ? (100 * d.free / d.total).toFixed(0) : "?";
   el.innerHTML = `
