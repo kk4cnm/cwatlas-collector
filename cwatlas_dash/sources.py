@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
+import shutil
 import sqlite3
+import subprocess
 import threading
 import time
 from contextlib import closing
@@ -167,3 +170,55 @@ def sdr_snapshot(host: str, port: int = 8073, ttl_s: float = 10.0,
         snap = _fetch_sdr(host, port)
         _SDR_CACHE[key] = (t, snap)
         return snap
+
+
+# ====================== system (systemd / journal / disk) =====================
+_ERROR_PAT = re.compile(r"traceback|error|exception|fail", re.IGNORECASE)
+
+
+def _monotonic_now_s() -> float:
+    """Seconds since boot (CLOCK_MONOTONIC matches systemd's *Monotonic props)."""
+    return time.clock_gettime(time.CLOCK_MONOTONIC)
+
+
+def system_health(unit: str = "cwatlas-collector",
+                  data_dir: Path | None = None,
+                  run=subprocess.run) -> dict:
+    out = run(["systemctl", "show", unit, "-p",
+               "ActiveState,SubState,NRestarts,MemoryCurrent,"
+               "ExecMainStartTimestamp,ExecMainStartTimestampMonotonic"],
+              capture_output=True, text=True, timeout=5).stdout
+    kv = dict(line.partition("=")[::2] for line in out.splitlines() if "=" in line)
+
+    uptime_s = None
+    mono_us = kv.get("ExecMainStartTimestampMonotonic", "0")
+    if kv.get("ActiveState") == "active" and mono_us.isdigit() and int(mono_us):
+        uptime_s = round(_monotonic_now_s() - int(mono_us) / 1e6, 0)
+
+    mem = kv.get("MemoryCurrent", "")
+    du = shutil.disk_usage(data_dir or DATA_DIR)
+    return {
+        "unit": unit,
+        "active_state": kv.get("ActiveState", "unknown"),
+        "sub_state": kv.get("SubState", "unknown"),
+        "n_restarts": int(kv.get("NRestarts", "0") or 0),
+        "memory_bytes": int(mem) if mem.isdigit() else None,
+        "started_at": kv.get("ExecMainStartTimestamp") or None,
+        "uptime_s": uptime_s,
+        "disk": {"path": str(data_dir or DATA_DIR),
+                 "total": du.total, "used": du.used, "free": du.free},
+    }
+
+
+def journal_tail(unit: str = "cwatlas-collector", n: int = 100,
+                 run=subprocess.run) -> dict:
+    proc = run(["journalctl", "-u", unit, "-n", str(n),
+                "--no-pager", "-o", "short-iso"],
+               capture_output=True, text=True, timeout=5)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"journal unreadable (is {os.environ.get('USER', 'the user')} in"
+            f" the systemd-journal group?): {proc.stderr.strip()}")
+    lines = proc.stdout.splitlines()
+    return {"lines": lines,
+            "errors": sum(1 for ln in lines if _ERROR_PAT.search(ln))}
