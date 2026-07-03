@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sqlite3
+import threading
 import time
 from contextlib import closing
 from pathlib import Path
@@ -134,6 +135,7 @@ def recent_captures(limit: int = 50, db_path: Path | None = None) -> list[dict]:
 # per ttl. Failures are NOT cached: a down SDR is re-probed each poll (short
 # timeout below bounds the stall).
 _SDR_CACHE: dict[str, tuple[float, dict]] = {}
+_SDR_LOCK = threading.Lock()  # single-flight under Flask threaded serving
 
 
 def _fetch_sdr(host: str, port: int) -> dict:
@@ -154,10 +156,14 @@ def sdr_snapshot(host: str, port: int = 8073, ttl_s: float = 10.0,
                  now=time.time) -> dict:
     """get_sdr_status + get_adc_overload equivalent, cached per host:port."""
     key = f"{host}:{port}"
-    t = now()
-    hit = _SDR_CACHE.get(key)
-    if hit and t - hit[0] < ttl_s:
+    hit = _SDR_CACHE.get(key)                 # fast path: no lock
+    if hit and now() - hit[0] < ttl_s:
         return hit[1]
-    snap = _fetch_sdr(host, port)
-    _SDR_CACHE[key] = (t, snap)
-    return snap
+    with _SDR_LOCK:                           # double-checked single-flight
+        t = now()
+        hit = _SDR_CACHE.get(key)
+        if hit and t - hit[0] < ttl_s:
+            return hit[1]
+        snap = _fetch_sdr(host, port)
+        _SDR_CACHE[key] = (t, snap)
+        return snap

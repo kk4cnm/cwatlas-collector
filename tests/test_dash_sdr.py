@@ -1,3 +1,6 @@
+import threading
+import time
+
 import httpx
 
 from cwatlas_dash import sources
@@ -45,3 +48,32 @@ def test_sdr_snapshot_does_not_cache_failures(monkeypatch):
     with pytest.raises(ConnectionError):
         sources.sdr_snapshot("h2")
     assert not sources._SDR_CACHE
+
+
+def test_sdr_snapshot_single_flight_under_threads(monkeypatch):
+    calls = []
+
+    def slow_fetch(h, p):
+        time.sleep(0.05)
+        calls.append(1)          # list.append is atomic under the GIL
+        return {"status": {"users": "0"}, "adc": {}}
+
+    monkeypatch.setattr(sources, "_fetch_sdr", slow_fetch)
+    sources._SDR_CACHE.clear()
+
+    n = 4
+    barrier = threading.Barrier(n)
+    results = [None] * n
+
+    def worker(i):
+        barrier.wait()
+        results[i] = sources.sdr_snapshot("h3", ttl_s=10.0)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(calls) == 1                    # exactly one device hit
+    assert all(r is results[0] for r in results)  # all got the same dict object
