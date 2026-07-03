@@ -12,6 +12,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.6"]
+dash = ["flask>=3"]
 
 [project.scripts]
 cwatlas-collector = "cwatlas_mcp.runtime:main"
@@ -21,4 +22,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["cwatlas_mcp"]
+packages = ["cwatlas_mcp", "cwatlas_dash"]
+
+[tool.setuptools.package-data]
+cwatlas_dash = ["templates/*", "static/*"]
