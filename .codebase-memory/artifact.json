@@ -1,0 +1,11 @@
+{
+    "schema_version": 1,
+    "commit": "8e8e6c6daaf80f55dc5af873acc25ca1b7c3ad12",
+    "indexed_at": "2026-06-23T13:31:15Z",
+    "project": "Users-danielnelms-cwatlas-collector",
+    "nodes": 147,
+    "edges": 397,
+    "original_size": 2097152,
+    "compressed_size": 157596,
+    "compression_level": 3
+}

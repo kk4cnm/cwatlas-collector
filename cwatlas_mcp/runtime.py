@@ -134,9 +134,13 @@ async def main() -> None:
                     default=os.environ.get("CWATLAS_FLEX_HOST", ""),
                     help="Flex radio IP for PTT ingest; 'auto' = UDP discovery; "
                          "empty = TX hygiene disabled (hardware relay only)")
+    ap.add_argument("--no-mcp", action="store_true",
+                    help="collect without the MCP sidecar (headless service: "
+                         "stdio transport needs a client on stdin; under "
+                         "systemd that's /dev/null and MCP would exit at once)")
     args = ap.parse_args()
 
-    if not args.trial:
+    if not args.trial and not args.no_mcp:
         # MCP-on-stdio owns stdout for JSON-RPC; every collector print() —
         # including the startup lines below — must go to stderr or it corrupts
         # the protocol stream. Rebinding print (rather than sys.stdout, which
@@ -188,7 +192,7 @@ async def main() -> None:
     else:
         print("[runtime] no --lat/--lon (or CWATLAS_LAT/LON): "
               "solar band weighting disabled, neutral priorities")
-    if not args.trial:
+    if not args.trial and not args.no_mcp:
         from . import server
         server.attach(state, bus, sdr, catalog)
         tasks.append(asyncio.create_task(server.mcp.run_stdio_async(), name="mcp"))

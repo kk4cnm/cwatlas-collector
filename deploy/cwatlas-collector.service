@@ -1,0 +1,29 @@
+[Unit]
+Description=CWAtlas CW collector (Web-888 -> MorseBase corpus)
+# LAN targets: SDR 192.168.2.46:8073, Flex 192.168.2.80:4992
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dnelms
+WorkingDirectory=/home/dnelms/cwatlas/collector
+Environment=PYTHONUNBUFFERED=1
+Environment=CWATLAS_SDR_HOST=192.168.2.46
+Environment=CWATLAS_DATA_DIR=/mnt/md0/cwatlas/data
+Environment=CWATLAS_LAT=33.427
+Environment=CWATLAS_LON=-82.208
+Environment=CWATLAS_FLEX_HOST=192.168.2.80
+# --no-mcp: stdio MCP needs a client on stdin; under systemd that's /dev/null.
+# Attach an agent by running the collector manually, or wait for the
+# streamable-HTTP transport milestone.
+ExecStart=/home/dnelms/cwatlas/collector/.venv/bin/python -m cwatlas_mcp.runtime --no-mcp
+# SIGTERM triggers the collector's graceful shutdown (workers finalize
+# in-flight SigMF files + catalog rows); give it time before SIGKILL
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=always
+RestartSec=20
+
+[Install]
+WantedBy=multi-user.target
