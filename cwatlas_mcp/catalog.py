@@ -67,6 +67,36 @@ class Catalog:
             "UPDATE captures SET contaminated=1 WHERE id=?", (cap_id,))
         self._db.commit()
 
+    def mark_window(self, start_ts: float, end_ts: float) -> int:
+        """Flag every capture whose recording overlaps [start_ts, end_ts]
+        (agent-reported contamination, e.g. a TX the PTT ingest missed)."""
+        cur = self._db.execute(
+            "UPDATE captures SET contaminated=1 WHERE started_utc <= ?"
+            " AND COALESCE(ended_utc, strftime('%s','now')) >= ?",
+            (end_ts, start_ts))
+        self._db.commit()
+        return cur.rowcount
+
+    def window_stats(self, since_ts: float) -> dict:
+        """Coverage/throughput summary for the MCP get_collection_stats tool."""
+        totals = self._db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(n_samples),0), SUM(contaminated)"
+            " FROM captures WHERE started_utc >= ?", (since_ts,)).fetchone()
+        by_band = self._db.execute(
+            "SELECT band, COUNT(*), COALESCE(SUM(n_samples),0),"
+            " COALESCE(SUM(n_samples * 1.0 / srate_hz), 0)"
+            " FROM captures WHERE started_utc >= ? GROUP BY band"
+            " ORDER BY 3 DESC", (since_ts,)).fetchall()
+        return {
+            "captures": totals[0],
+            "iq_hours": round(sum(r[3] for r in by_band) / 3600.0, 1),
+            "bytes": totals[1] * 4,          # ci16: 4 bytes per complex sample
+            "contaminated": totals[2] or 0,
+            "by_band": {r[0]: {"captures": r[1],
+                               "iq_hours": round(r[3] / 3600.0, 2)}
+                        for r in by_band},
+        }
+
     def stats(self) -> dict:
         row = self._db.execute(
             "SELECT COUNT(*), COALESCE(SUM(n_samples),0),"

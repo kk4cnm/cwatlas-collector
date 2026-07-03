@@ -232,6 +232,7 @@ async def channel_worker(sdr: SdrClient, cs: ChannelState, inbox: asyncio.Queue,
 
 def self_release(cs: ChannelState, det: Detection) -> None:
     """Mark the slot idle, but only if it's still ours (see clobber note above)."""
-    if cs.mode == ChannelMode.CAPTURING and cs.freq_hz == det.freq_hz:
+    if (cs.mode in (ChannelMode.CAPTURING, ChannelMode.DEEP_DWELL)
+            and cs.freq_hz == det.freq_hz):
         cs.mode = ChannelMode.IDLE
         cs.freq_hz = None

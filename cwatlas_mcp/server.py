@@ -9,11 +9,13 @@ For a remote agent, switch to MCP streamable-HTTP transport (see __main__).
 """
 from __future__ import annotations
 
+import time
 from dataclasses import asdict
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
+from .catalog import Catalog
 from .models import Nudge
 from .scheduler import CollectorState, ControlBus
 from .sdr_client import SdrClient, SdrConfig
@@ -25,11 +27,13 @@ mcp = FastMCP("cwatlas")
 STATE: Optional[CollectorState] = None
 BUS: Optional[ControlBus] = None
 SDR: Optional[SdrClient] = None
+CATALOG: Optional[Catalog] = None
 
 
-def attach(state: CollectorState, bus: ControlBus, sdr: SdrClient) -> None:
-    global STATE, BUS, SDR
-    STATE, BUS, SDR = state, bus, sdr
+def attach(state: CollectorState, bus: ControlBus, sdr: SdrClient,
+           catalog: Optional[Catalog] = None) -> None:
+    global STATE, BUS, SDR, CATALOG
+    STATE, BUS, SDR, CATALOG = state, bus, sdr, catalog
 
 
 def _require():
@@ -86,10 +90,25 @@ async def get_adc_overload() -> dict:
 
 @mcp.tool()
 async def get_collection_stats(window: str = "24h") -> dict:
-    """Coverage/throughput over the long run (catalog DB)."""
-    # TODO: query the catalog DB for captures/bytes/band coverage over `window`.
+    """Coverage/throughput over `window` ("30m", "24h", "7d"): captures, IQ hours,
+    bytes, contamination, per-band breakdown. Backed by the catalog DB."""
     _require()
-    return {"window": window, "note": "TODO: implement against catalog DB"}
+    if CATALOG is None:
+        raise RuntimeError("no catalog attached")
+    n, unit = float(window[:-1]), window[-1]
+    seconds = n * {"m": 60, "h": 3600, "d": 86400}[unit]
+    return {"window": window, **CATALOG.window_stats(time.time() - seconds)}
+
+
+@mcp.tool()
+async def get_band_priorities() -> dict:
+    """Current scheduling weights: solar baseline per band, plus any live agent
+    nudge multipliers (with seconds until they expire). Effective = solar x nudge."""
+    state, _, _ = _require()
+    now = time.time()
+    nudges = {b: {"mult": m, "expires_in_s": round(exp - now, 0)}
+              for b, (m, exp) in state.band_nudge.items() if exp > now}
+    return {"solar_baseline": dict(state.band_priority), "nudges": nudges}
 
 
 # =============================== Nudge ===================================

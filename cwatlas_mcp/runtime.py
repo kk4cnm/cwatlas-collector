@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import signal
 from pathlib import Path
 
 from . import capture
@@ -56,8 +57,9 @@ async def solar_worker(sup: Supervisor, lat: float, lon: float,
 
     Biases capture assignment toward bands that are actually open (high bands by
     day, low bands after dark, gray-line boost at twilight) — cuts false-positive
-    captures on closed bands. NB: writes the same band_priority dict agent nudges
-    use; M4 must reconcile (e.g. nudges as multipliers on the solar baseline).
+    captures on closed bands. Agent nudges live in the separate state.band_nudge
+    dict and multiply this baseline (see Supervisor._nudge_mult), so neither
+    writer clobbers the other.
     """
     from .solar import band_weights
 
@@ -72,15 +74,10 @@ async def solar_worker(sup: Supervisor, lat: float, lon: float,
         await asyncio.sleep(every_s)
 
 
-async def ptt_worker(sup: Supervisor) -> None:
-    """Operator TX state (Flex amp-key via GPIO/serial or SmartSDR CAT) -> sup.set_tx().
-
-    NB: the hardware antenna-disconnect relay is the actual front-end protection;
-    this is data hygiene only (mark capture windows contaminated). TODO[M3]: real
-    PTT ingest — until then TX periods rely on the relay muting the captures.
-    """
-    while True:
-        await asyncio.sleep(0.5)
+# PTT ingest (M3) lives in ptt.py: Flex SmartSDR interlock status -> sup.set_tx().
+# Data hygiene only — the hardware antenna-disconnect relay is the front-end
+# protection. With no --flex-host the collector runs relay-only (TX periods
+# record muted antenna instead of being flagged in the catalog).
 
 
 class ChannelPool:
@@ -133,7 +130,21 @@ async def main() -> None:
                     default=float(os.environ.get("CWATLAS_LON", "nan")))
     ap.add_argument("--rotate-s", type=float, default=600.0,
                     help="max seconds per capture file segment")
+    ap.add_argument("--flex-host",
+                    default=os.environ.get("CWATLAS_FLEX_HOST", ""),
+                    help="Flex radio IP for PTT ingest; 'auto' = UDP discovery; "
+                         "empty = TX hygiene disabled (hardware relay only)")
     args = ap.parse_args()
+
+    if not args.trial:
+        # MCP-on-stdio owns stdout for JSON-RPC; every collector print() —
+        # including the startup lines below — must go to stderr or it corrupts
+        # the protocol stream. Rebinding print (rather than sys.stdout, which
+        # FastMCP reads at startup) leaves the real stdout to the transport.
+        import builtins
+        import functools
+        import sys
+        builtins.print = functools.partial(print, file=sys.stderr, flush=True)
 
     sdr = SdrClient(SdrConfig(host=args.host, port=args.port))
 
@@ -150,7 +161,7 @@ async def main() -> None:
     cfg = SchedulerConfig(n_rx_channels=rx_chans - 1)
     # Supervisor must exist before the pool (it populates state.channels), but the
     # pool must exist before ticks assign — construct in this order:
-    sup = Supervisor(cfg, state, bus)
+    sup = Supervisor(cfg, state, bus, catalog=catalog)
     pool = ChannelPool(sdr, state, catalog, args.data_dir, rotate_s=args.rotate_s)
     sup.spawn_capture = pool.spawn
     sup.stop_capture = pool.stop
@@ -158,8 +169,19 @@ async def main() -> None:
     tasks = [
         asyncio.create_task(sup.run(), name="supervisor"),
         asyncio.create_task(scan_worker(sdr, sup), name="scanner"),
-        asyncio.create_task(ptt_worker(sup), name="ptt"),
     ]
+    if args.flex_host:
+        from .ptt import discover_flex, flex_ptt_worker
+        flex = args.flex_host
+        if flex == "auto":
+            flex = await discover_flex()
+            print(f"[runtime] flex discovery: {flex or 'nothing heard'}")
+        if flex:
+            tasks.append(asyncio.create_task(
+                flex_ptt_worker(sup, flex), name="ptt"))
+    else:
+        print("[runtime] no --flex-host (or CWATLAS_FLEX_HOST): TX hygiene "
+              "disabled, hardware relay only")
     if args.lat == args.lat and args.lon == args.lon:  # NaN-safe "both set"
         tasks.append(asyncio.create_task(
             solar_worker(sup, args.lat, args.lon), name="solar"))
@@ -168,8 +190,16 @@ async def main() -> None:
               "solar band weighting disabled, neutral priorities")
     if not args.trial:
         from . import server
-        server.attach(state, bus, sdr)
+        server.attach(state, bus, sdr, catalog)
         tasks.append(asyncio.create_task(server.mcp.run_stdio_async(), name="mcp"))
+
+    # graceful shutdown on SIGTERM/SIGINT (systemctl stop, ^C, plain kill):
+    # fall through to the finally block so workers finalize in-flight
+    # files/rows instead of orphaning them (the old way to make catalog junk)
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, stop.set)
 
     try:
         if args.trial:
@@ -179,7 +209,14 @@ async def main() -> None:
                 if not t.cancelled() and t.exception():
                     raise t.exception()
         else:
-            await asyncio.gather(*tasks)
+            waiter = asyncio.create_task(stop.wait(), name="stop-signal")
+            done, _ = await asyncio.wait([*tasks, waiter],
+                                         return_when=asyncio.FIRST_COMPLETED)
+            for t in done:   # a worker crashing also lands here — surface it
+                if t is not waiter and not t.cancelled() and t.exception():
+                    raise t.exception()
+            if stop.is_set():
+                print("[runtime] stop signal: shutting down cleanly")
     finally:
         for t in tasks:
             t.cancel()

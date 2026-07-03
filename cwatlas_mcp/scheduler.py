@@ -16,6 +16,23 @@ from typing import Callable, Optional
 
 from .models import ChannelMode, ChannelState, Detection, Nudge, TxEvent
 
+# Amateur band edges (Hz) for classifying agent-pinned frequencies.
+BAND_EDGES = [
+    ("160m", 1_800e3, 2_000e3), ("80m", 3_500e3, 4_000e3),
+    ("60m", 5_330e3, 5_407e3), ("40m", 7_000e3, 7_300e3),
+    ("30m", 10_100e3, 10_150e3), ("20m", 14_000e3, 14_350e3),
+    ("17m", 18_068e3, 18_168e3), ("15m", 21_000e3, 21_450e3),
+    ("12m", 24_890e3, 24_990e3), ("10m", 28_000e3, 29_700e3),
+    ("6m", 50_000e3, 54_000e3),
+]
+
+
+def band_for_freq(freq_hz: float) -> str:
+    for band, lo, hi in BAND_EDGES:
+        if lo <= freq_hz <= hi:
+            return band
+    return "oob"
+
 
 @dataclass
 class SchedulerConfig:
@@ -71,21 +88,30 @@ class CollectorState:
 
     channels: dict[int, ChannelState] = field(default_factory=dict)
     activity: dict[float, Detection] = field(default_factory=dict)  # keyed by freq_hz
+    # solar baseline, written by solar_worker (or left empty = neutral 1.0)
     band_priority: dict[str, float] = field(default_factory=dict)
+    # agent-nudge multipliers ON TOP of the solar baseline: band -> (mult, expires_at).
+    # Separate dict so solar refreshes never clobber a nudge and vice versa;
+    # the TTL keeps a forgotten nudge from steering collection forever.
+    band_nudge: dict[str, tuple[float, float]] = field(default_factory=dict)
     tx_active: bool = False
     tx_events: list[TxEvent] = field(default_factory=list)
 
 
 class Supervisor:
+    NUDGE_TTL_S = 900.0   # agent band nudges decay after 15 min unless renewed
+
     def __init__(self, cfg: SchedulerConfig, state: CollectorState, bus: ControlBus,
                  spawn_capture: Optional[Callable[[int, Detection], None]] = None,
-                 stop_capture: Optional[Callable[[int], None]] = None):
+                 stop_capture: Optional[Callable[[int], None]] = None,
+                 catalog=None):
         self.cfg = cfg
         self.state = state
         self.bus = bus
         # runtime wires these to real capture-worker task management; None in tests
         self.spawn_capture = spawn_capture
         self.stop_capture = stop_capture
+        self.catalog = catalog        # for mark_contaminated nudges; None in tests
         for ch in range(cfg.n_rx_channels):
             state.channels[ch] = ChannelState(ch=ch)
 
@@ -144,21 +170,62 @@ class Supervisor:
     def _apply_nudges(self, nudges: list[Nudge]) -> None:
         for n in nudges:
             if n.kind == "prioritize_band":
-                self.state.band_priority[n.payload["band"]] = n.payload["weight"]
+                # multiplier on the solar baseline, not an overwrite — solar
+                # keeps refreshing band_priority underneath and both survive
+                ttl = float(n.payload.get("ttl_s", self.NUDGE_TTL_S))
+                self.state.band_nudge[n.payload["band"]] = (
+                    n.payload["weight"], time.time() + ttl)
             elif n.kind == "pause_channel":
                 self._set_mode(n.payload["ch"], ChannelMode.PAUSED)
             elif n.kind == "resume_channel":
                 self._set_mode(n.payload["ch"], ChannelMode.IDLE)
             elif n.kind in ("pin_frequency", "request_deep_dwell"):
-                # TODO: force-assign an idle channel to payload["freq_hz"].
-                pass
+                self._pin(n)
+            elif n.kind == "notify_tx":
+                self.set_tx(bool(n.payload["active"]))
+            elif n.kind == "mark_contaminated" and self.catalog is not None:
+                self.catalog.mark_window(n.payload["start_ts"],
+                                         n.payload["end_ts"])
             # unknown kinds ignored on purpose (forward-compatible)
+
+    def _pin(self, n: Nudge) -> None:
+        """Force-assign an idle channel to an agent-chosen frequency.
+
+        The pin rides the normal lifecycle: a synthetic high-confidence
+        Detection goes on the activity map and an idle channel is assigned
+        directly. If the scanner doesn't confirm the frequency it goes stale
+        and releases after release_timeout_s (~150 s), so dwell_s requests
+        beyond that need the agent to re-pin.
+        """
+        freq = float(n.payload["freq_hz"])
+        det = Detection(freq_hz=freq, band=band_for_freq(freq),
+                        strength_db=99.0, keyed_confidence=1.0)
+        self.state.activity[freq] = det
+        ch = self._first_idle()
+        if ch is None:
+            print(f"[supervisor] pin {freq/1e3:.2f} kHz: no idle channel")
+            return
+        self._assign(ch, det)
+        if n.kind == "request_deep_dwell":
+            self.state.channels[ch].mode = ChannelMode.DEEP_DWELL
+        print(f"[supervisor] ch{ch} pinned to {freq/1e3:.2f} kHz ({n.kind})")
+
+    def _nudge_mult(self, band: str) -> float:
+        entry = self.state.band_nudge.get(band)
+        if entry is None:
+            return 1.0
+        mult, expires = entry
+        if time.time() >= expires:
+            del self.state.band_nudge[band]
+            return 1.0
+        return mult
 
     # ---- scoring & reconciliation ---------------------------------------
     def _score_candidates(self) -> list[Detection]:
         """Rank active detections worth capturing. Higher = more deserving."""
         def score(d: Detection) -> float:
-            prio = self.state.band_priority.get(d.band, 1.0)
+            prio = (self.state.band_priority.get(d.band, 1.0)
+                    * self._nudge_mult(d.band))
             # priority > keyed_confidence > strength > (TODO) coverage_debt
             return prio * (d.keyed_confidence * 10 + d.strength_db)
 
@@ -178,7 +245,8 @@ class Supervisor:
     def _reconcile(self, desired: list[Detection]) -> None:
         # 1. release stale channels (respecting min dwell) and max-dwell hogs
         for ch in self.state.channels.values():
-            if ch.mode == ChannelMode.CAPTURING and ch.freq_hz is not None:
+            if (ch.mode in (ChannelMode.CAPTURING, ChannelMode.DEEP_DWELL)
+                    and ch.freq_hz is not None):
                 det = self.state.activity.get(ch.freq_hz)
                 stale = det is None or det.age_s > self.cfg.release_timeout_s
                 if stale and ch.dwell_s > self.cfg.min_dwell_s:
@@ -241,15 +309,26 @@ class Supervisor:
 
     # ---- TX hygiene ------------------------------------------------------
     def set_tx(self, active: bool) -> None:
-        """Driven by the PTT ingest (Flex amp-key / SmartSDR CAT)."""
+        """Driven by the PTT ingest (see ptt.py: Flex interlock status)."""
+        if active == self.state.tx_active:
+            return
         self.state.tx_active = active
         if active:
             self.state.tx_events.append(TxEvent(start_ts=time.time()))
-        elif self.state.tx_events and self.state.tx_events[-1].stop_ts is None:
-            self.state.tx_events[-1].stop_ts = time.time()
+            print("[supervisor] TX active: holding assignments, flagging captures")
+        else:
+            if self.state.tx_events and self.state.tx_events[-1].stop_ts is None:
+                self.state.tx_events[-1].stop_ts = time.time()
+            # files that overlapped TX latched their own contaminated flag in
+            # the capture worker; clear the channel flags so the NEXT file
+            # segment on each channel starts clean
+            for cs in self.state.channels.values():
+                cs.contaminated = False
+            print("[supervisor] TX ended: resuming assignments")
 
     def _handle_tx(self) -> None:
+        """Each tick while transmitting. New assignments are held (tick returns
+        early); in-flight captures keep running but their files get flagged."""
         for cs in self.state.channels.values():
-            if cs.mode == ChannelMode.CAPTURING:
+            if cs.mode in (ChannelMode.CAPTURING, ChannelMode.DEEP_DWELL):
                 cs.contaminated = True
-        # TODO: mark affected catalog capture windows contaminated; hold new assignments.
