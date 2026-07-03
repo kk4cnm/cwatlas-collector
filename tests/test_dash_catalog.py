@@ -12,6 +12,8 @@ def test_collection_stats_1h(fixture_db):
     assert s["by_band"]["20m"]["captures"] == 2  # finalized + in-flight
     # one finalized 60 s 20m capture; the in-flight row has n_samples=0
     assert s["by_band"]["40m"]["iq_hours"] == round(60 / 3600, 2)
+    # top-level iq_hours rounds to 1 decimal (Catalog.window_stats parity)
+    assert s["iq_hours"] == round(120 / 3600, 1)
     assert s["bytes"] == 2 * 60 * 12_000 * 4     # ci16: 4 bytes/sample
 
 
@@ -37,8 +39,8 @@ def test_totals(fixture_db):
 
 
 def test_db_is_opened_read_only(fixture_db):
-    import pytest, sqlite3
-    with pytest.raises(sqlite3.OperationalError):
-        db = sources._connect(fixture_db)
-        db.execute("INSERT INTO captures (freq_hz, band, started_utc,"
-                   " srate_hz, path) VALUES (1,'x',1,1,'x')")
+    import contextlib, pytest, sqlite3
+    with contextlib.closing(sources._connect(fixture_db)) as db:
+        with pytest.raises(sqlite3.OperationalError):
+            db.execute("INSERT INTO captures (freq_hz, band, started_utc,"
+                       " srate_hz, path) VALUES (1,'x',1,1,'x')")

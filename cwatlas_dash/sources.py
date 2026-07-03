@@ -34,7 +34,7 @@ def _connect(db_path: Path | None = None) -> sqlite3.Connection:
 def collection_stats(window: str, db_path: Path | None = None,
                      now: float | None = None) -> dict:
     """Same shape as the MCP get_collection_stats tool / Catalog.window_stats."""
-    since = (now or time.time()) - WINDOWS[window]
+    since = (time.time() if now is None else now) - WINDOWS[window]
     with closing(_connect(db_path)) as db:
         tot = db.execute(
             "SELECT COUNT(*), COALESCE(SUM(n_samples),0),"
@@ -47,7 +47,7 @@ def collection_stats(window: str, db_path: Path | None = None,
     return {
         "window": window,
         "captures": tot[0],
-        "iq_hours": round(sum(r[2] for r in by_band) / 3600.0, 2),
+        "iq_hours": round(sum(r[2] for r in by_band) / 3600.0, 1),
         "bytes": tot[1] * BYTES_PER_SAMPLE,
         "contaminated": tot[2],
         "by_band": {r[0]: {"captures": r[1], "iq_hours": round(r[2] / 3600.0, 2)}
