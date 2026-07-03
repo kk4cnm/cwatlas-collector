@@ -11,6 +11,7 @@ slots — never do that from the dashboard).
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import sqlite3
 import time
@@ -126,3 +127,37 @@ def recent_captures(limit: int = 50, db_path: Path | None = None) -> list[dict]:
          "contaminated": bool(r[8]), "smeter_avg": r[9]}
         for r in rows
     ]
+
+
+# ========================= SDR (AJAX info plane only) =========================
+# Cache so N browser tabs polling every 15 s produce at most one device hit
+# per ttl. Failures are NOT cached: a down SDR is re-probed each poll (short
+# timeout below bounds the stall).
+_SDR_CACHE: dict[str, tuple[float, dict]] = {}
+
+
+def _fetch_sdr(host: str, port: int) -> dict:
+    from cwatlas_mcp.sdr_client import SdrClient, SdrConfig
+
+    async def go() -> dict:
+        sdr = SdrClient(SdrConfig(host=host, port=port))
+        try:
+            return {"status": await sdr.get_status(),
+                    "adc": await sdr.get_adc()}
+        finally:
+            await sdr.aclose()
+
+    return asyncio.run(asyncio.wait_for(go(), timeout=4.0))
+
+
+def sdr_snapshot(host: str, port: int = 8073, ttl_s: float = 10.0,
+                 now=time.time) -> dict:
+    """get_sdr_status + get_adc_overload equivalent, cached per host:port."""
+    key = f"{host}:{port}"
+    t = now()
+    hit = _SDR_CACHE.get(key)
+    if hit and t - hit[0] < ttl_s:
+        return hit[1]
+    snap = _fetch_sdr(host, port)
+    _SDR_CACHE[key] = (t, snap)
+    return snap
