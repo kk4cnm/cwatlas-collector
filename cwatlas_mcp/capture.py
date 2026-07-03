@@ -181,6 +181,10 @@ async def channel_worker(sdr: SdrClient, cs: ChannelState, inbox: asyncio.Queue,
                         continue
             if cmd is SHUTDOWN:
                 return
+            if cmd is None:
+                # release arrived while already idle (stall self-release raced
+                # the supervisor's stop): nothing to do, keep the session
+                continue
             det: Detection = cmd  # type: ignore[assignment]
 
             # ---- (re)acquire the session, retune in place ----------------
