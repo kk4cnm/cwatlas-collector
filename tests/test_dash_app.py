@@ -48,6 +48,9 @@ def test_captures_endpoint_clamps_limit(client):
     assert isinstance(r.get_json()["captures"], list)
     r = client.get("/api/captures?limit=-3")
     assert r.status_code == 200
+    r = client.get("/api/captures?limit=0")
+    assert r.status_code == 200
+    assert len(r.get_json()["captures"]) == 1   # clamped to 1, not default 50
 
 
 def test_index_renders(client):

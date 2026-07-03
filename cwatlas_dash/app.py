@@ -57,7 +57,9 @@ def create_app(**overrides) -> Flask:
 
     @app.get("/api/captures")
     def captures():
-        limit = max(1, min(request.args.get("limit", 50, type=int) or 50, 500))
+        limit = request.args.get("limit", type=int)  # None if absent/unparseable
+        limit = 50 if limit is None else limit       # default only when missing
+        limit = max(1, min(limit, 500))              # clamp 1..500 (0 -> 1)
         db = app.config["DATA_DIR"] / "catalog.db"
         return jsonify({"captures": _guard(sources.recent_captures,
                                            limit=limit, db_path=db)})
