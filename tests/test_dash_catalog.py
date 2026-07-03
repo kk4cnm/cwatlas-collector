@@ -11,7 +11,7 @@ def test_collection_stats_1h(fixture_db):
     assert set(s["by_band"]) == {"20m", "40m"}
     assert s["by_band"]["20m"]["captures"] == 2  # finalized + in-flight
     # one finalized 60 s 20m capture; the in-flight row has n_samples=0
-    assert abs(s["by_band"]["40m"]["iq_hours"] - 60 / 3600) < 1e-6
+    assert s["by_band"]["40m"]["iq_hours"] == round(60 / 3600, 2)
     assert s["bytes"] == 2 * 60 * 12_000 * 4     # ci16: 4 bytes/sample
 
 

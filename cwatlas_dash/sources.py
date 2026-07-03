@@ -50,7 +50,7 @@ def collection_stats(window: str, db_path: Path | None = None,
         "iq_hours": round(sum(r[2] for r in by_band) / 3600.0, 2),
         "bytes": tot[1] * BYTES_PER_SAMPLE,
         "contaminated": tot[2],
-        "by_band": {r[0]: {"captures": r[1], "iq_hours": r[2] / 3600.0}
+        "by_band": {r[0]: {"captures": r[1], "iq_hours": round(r[2] / 3600.0, 2)}
                     for r in by_band},
     }
 
