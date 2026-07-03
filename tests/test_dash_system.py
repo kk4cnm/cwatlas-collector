@@ -41,10 +41,14 @@ def test_system_health_unit_gone(tmp_path):
 def test_journal_tail_counts_errors():
     out = ("2026-07-03T10:00:00 airig-01 python[1]: [runtime] ok\n"
            "2026-07-03T10:00:01 airig-01 python[1]: Traceback (most recent...\n"
-           "2026-07-03T10:00:02 airig-01 python[1]: ValueError: boom\n")
+           "2026-07-03T10:00:02 airig-01 python[1]: ValueError: boom\n"
+           "2026-07-03T10:00:03 airig-01 python[1]: No errors detected in scan\n"
+           "2026-07-03T10:00:04 airig-01 python[1]: fail-safe mode disabled\n"
+           "2026-07-03T10:00:05 airig-01 systemd[1]: Failed to start"
+           " cwatlas-collector.service\n")
     j = sources.journal_tail(run=fake_run_factory(out))
-    assert len(j["lines"]) == 3
-    assert j["errors"] == 2
+    assert len(j["lines"]) == 6
+    assert j["errors"] == 3
 
 
 def test_journal_tail_permission_denied():

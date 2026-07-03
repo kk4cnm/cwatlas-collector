@@ -173,7 +173,13 @@ def sdr_snapshot(host: str, port: int = 8073, ttl_s: float = 10.0,
 
 
 # ====================== system (systemd / journal / disk) =====================
-_ERROR_PAT = re.compile(r"traceback|error|exception|fail", re.IGNORECASE)
+# Error *signatures*, not substrings: Python stack dumps ("Traceback"),
+# CamelCase exception class names (ValueError, RuntimeError — case-sensitive so
+# prose like "no errors" doesn't hit), uppercase ERROR level tags, and systemd
+# failure verbs ("Failed to start", "failure"). Deliberately does NOT match
+# negations like "No errors detected" or "fail-safe".
+_ERROR_PAT = re.compile(
+    r"Traceback|\w*(?:Error|Exception)\b|\bERROR\b|(?i:\bfail(?:ed|ure)\b)")
 
 
 def _monotonic_now_s() -> float:
