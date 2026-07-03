@@ -1,0 +1,37 @@
+:root {
+  --bg: #101418; --panel: #1a2027; --line: #2a323c;
+  --fg: #d7dee6; --dim: #8494a6;
+  --ok: #3fb68b; --warn: #d9a13f; --bad: #d95f4f; --accent: #4f9dd9;
+}
+* { box-sizing: border-box; margin: 0; }
+body { background: var(--bg); color: var(--fg);
+       font: 14px/1.45 system-ui, sans-serif; padding: 0 1rem 3rem; }
+header { display: flex; align-items: baseline; gap: 1rem; padding: 1rem 0; }
+h1 { font-size: 1.15rem; } h2 { font-size: .8rem; text-transform: uppercase;
+     letter-spacing: .08em; color: var(--dim); margin-bottom: .5rem; }
+.sub { color: var(--dim); font-size: .8rem; font-weight: normal; }
+main { display: grid; gap: .8rem; max-width: 1100px; margin: auto; }
+section { background: var(--panel); border: 1px solid var(--line);
+          border-radius: 8px; padding: .8rem 1rem; }
+.strip { display: flex; flex-wrap: wrap; gap: 1.5rem; }
+.strip .item b { display: block; font-size: .7rem; color: var(--dim);
+                 text-transform: uppercase; letter-spacing: .06em; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr));
+         gap: .8rem; background: none; border: none; padding: 0; }
+.card { background: var(--panel); border: 1px solid var(--line);
+        border-radius: 8px; padding: .8rem 1rem; }
+.card .big { font-size: 1.5rem; font-variant-numeric: tabular-nums; }
+.card h3 { font-size: .7rem; color: var(--dim); text-transform: uppercase; }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: .25rem .5rem; border-bottom: 1px solid var(--line); }
+th { color: var(--dim); font-size: .7rem; text-transform: uppercase; }
+td.num, th.num { text-align: right; }
+pre { overflow-x: auto; font-size: .75rem; color: var(--dim); max-height: 16rem; }
+.ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+.error { color: var(--bad); font-style: italic; }
+.hidden { display: none; }
+#stale-banner { background: var(--bad); color: #fff; padding: .2rem .6rem;
+                border-radius: 4px; font-size: .8rem; }
+svg .bar { fill: var(--accent); } svg .contam { fill: var(--bad); }
+svg text { fill: var(--dim); font-size: 9px; }
+.wide .body { overflow-x: auto; }

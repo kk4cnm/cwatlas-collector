@@ -1,3 +1,26 @@
 <!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CWAtlas Collector</title>
-<h1>CWAtlas Collector — dashboard loading…</h1>
+<link rel="stylesheet" href="{{ url_for('static', filename='dash.css') }}">
+</head>
+<body>
+<header>
+  <h1>CWAtlas Collector <span class="sub">airig-01 &middot; Web-888 &rarr; MorseBase</span></h1>
+  <div id="stale-banner" class="hidden">data stale — polling failed</div>
+</header>
+<main>
+  <section id="panel-status" class="strip"></section>
+  <section id="panel-totals" class="cards"></section>
+  <section id="panel-windows" class="cards"></section>
+  <section id="panel-chart" class="wide"><h2>Captures — last 24 h</h2><div class="body"></div></section>
+  <section id="panel-inflight" class="wide"><h2>Capturing now</h2><div class="body"></div></section>
+  <section id="panel-recent" class="wide"><h2>Recent captures</h2><div class="body"></div></section>
+  <section id="panel-solar" class="wide"><h2>Band priorities (solar baseline)</h2><div class="body"></div></section>
+  <section id="panel-journal" class="wide"><h2>Collector journal</h2><div class="body"></div></section>
+</main>
+<script src="{{ url_for('static', filename='dash.js') }}"></script>
+</body>
+</html>
