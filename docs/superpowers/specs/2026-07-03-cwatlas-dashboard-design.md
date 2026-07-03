@@ -137,6 +137,10 @@ Panel visual design follows the dataviz skill guidance at implementation time.
 built-in server (threaded) is sufficient for a single-operator LAN dashboard; if it
 ever needs hardening, waitress is a drop-in.
 
+Implementation includes installing and activating the unit on airig-01
+(`systemctl enable --now cwatlas-dash`) so the dashboard starts on boot and is
+always reachable — same operational posture as the collector itself.
+
 ## Out of scope (explicit)
 
 - Any control actions (pause/resume/nudge) — the control bus is in-process only.
