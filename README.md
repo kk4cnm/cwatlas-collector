@@ -40,6 +40,20 @@ python -m cwatlas_mcp.runtime
 Point it at your device by editing `SdrConfig` (host/port/password) in `runtime.py`, or
 wire it to env/config at M0.
 
+## Auditioning captures
+
+Captures are SigMF: headerless complex int16 IQ at 1.5 kHz (`ci16_le`, carrier at
+~+250 Hz baseband) — they play as noise in a media player. Use
+`scripts/sigmf_listen.py` to render them as WAV at an audible sidetone pitch, and to
+pick strong captures from the catalog:
+
+```bash
+.venv/bin/python scripts/sigmf_listen.py --top 20 --band 40m   # list strongest clean captures
+.venv/bin/python scripts/sigmf_listen.py --id 1902             # write <capture>.wav beside the data
+```
+
+Details in [docs/sigmf_listen.md](docs/sigmf_listen.md).
+
 ## Design invariants (don't break these)
 
 - **MCP is control plane only** — never stream IQ/audio through tool calls.
