@@ -104,9 +104,13 @@ def provenance_health(db_path: Path | None = None) -> dict:
             " AND id < (SELECT MAX(id) FROM runs WHERE kind='collector')"
         ).fetchone()[0]
 
-        # THE ONE THAT MATTERS MOST. Non-zero means IQ in the corpus came from
-        # code that exists nowhere in git — unreproducible by construction, and
-        # unfixable after the fact.
+        # HISTORY, NOT AN ALARM. Non-zero means IQ in the corpus came from code
+        # that exists nowhere in git — unreproducible by construction. Note the
+        # "unfixable after the fact" part: this count can never go down, so it
+        # must NOT gate `ok`. A single dirty run would otherwise leave the
+        # dashboard permanently red with nothing anyone can do about it, which
+        # is how a signal becomes wallpaper. What's actionable is whether the
+        # run happening NOW is dirty; that's in `ok` via current_run below.
         from_dirty = db.execute(
             "SELECT COUNT(*) FROM captures c JOIN runs r ON c.run_id = r.id"
             " WHERE r.git_dirty = 1").fetchone()[0]
@@ -120,7 +124,9 @@ def provenance_health(db_path: Path | None = None) -> dict:
         "unstamped_captures": unstamped,
         "unclean_exits": unclean,
         "captures_from_dirty_code": from_dirty,
-        "ok": unstamped == 0 and from_dirty == 0,
+        # Only conditions someone can act on right now: provenance is broken, or
+        # the collector is currently recording IQ from uncommitted code.
+        "ok": unstamped == 0 and not (current and current[2]),
         "current_run": ({"id": current[0],
                          "git_commit": (current[1] or "")[:7] or None,
                          "git_dirty": bool(current[2]),

@@ -88,8 +88,9 @@ def test_an_older_open_run_is_an_unclean_exit(tmp_path):
     assert h["ok"] is True         # not an error — visible, not alarming
 
 
-def test_captures_from_dirty_code_are_counted(tmp_path):
-    """IQ from code that exists nowhere in git: unreproducible by construction."""
+def test_a_dirty_current_run_is_not_ok(tmp_path):
+    """IQ being recorded right now from code that exists nowhere in git —
+    actionable: commit, restart."""
     path, db = _db(tmp_path)
     clean, dirty = _run(db, dirty=0), _run(db, dirty=1, ended=None)
     _capture(db, clean)
@@ -101,6 +102,27 @@ def test_captures_from_dirty_code_are_counted(tmp_path):
     assert h["captures_from_dirty_code"] == 2
     assert h["ok"] is False
     assert h["current_run"]["git_dirty"] is True
+
+
+def test_past_dirty_captures_do_not_pin_ok_false_forever(tmp_path):
+    """The count can never go down — a past dirty run must not leave the panel
+    permanently red with nothing anyone can do. An alarm that cannot be cleared
+    is one people stop reading; `ok` tracks only what's actionable now.
+
+    (Learned live: run 5 recorded 21 captures from an uncommitted tree, and the
+    first cut of this metric would have been red for the rest of the project.)
+    """
+    path, db = _db(tmp_path)
+    old_dirty = _run(db, dirty=1, ended=100.0)      # happened; can't unhappen
+    _capture(db, old_dirty)
+    now_clean = _run(db, dirty=0, ended=None)       # current run, clean
+    _capture(db, now_clean)
+    db.commit()
+
+    h = sources.provenance_health(db_path=path)
+    assert h["captures_from_dirty_code"] == 1       # still reported, as history
+    assert h["current_run"]["git_dirty"] is False
+    assert h["ok"] is True                          # nothing to act on
 
 
 def test_synthetic_run_is_not_mistaken_for_a_collector(tmp_path):
