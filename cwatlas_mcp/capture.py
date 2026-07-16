@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import time
 from pathlib import Path
 
@@ -134,20 +135,35 @@ async def _write_capture(session: IqSession, cs: ChannelState,
                     await session.ws.send("SET keepalive")
                     last_ka = time.time()
     finally:
-        meta = _sigmf_meta(det, FS_OUT, started,
-                           gps_first[0] if gps_first else None,
-                           contaminated, n_samples)
-        with open(f"{base}.sigmf-meta", "w") as fm:
-            json.dump(meta, fm, indent=1)
-        catalog.finalize_capture(
-            cap_id, n_samples=n_samples, contaminated=contaminated,
-            smeter_avg=(smeter_sum / smeter_n) if smeter_n else None)
+        # Each step here is isolated: whatever we're unwinding from, a failure
+        # writing the sidecar must not skip the catalog update. The sidecar is
+        # regenerable from the row; a row left in flight is forever (it reads as
+        # "still capturing" to the dash and to mark_window's COALESCE, with no
+        # later pass to close it). Learned the hard way: a disk mounted over
+        # /mnt shadowed the data dir for 3 min and orphaned 7 rows for 18 h.
+        meta_err: Exception | None = None
+        try:
+            meta = _sigmf_meta(det, FS_OUT, started,
+                               gps_first[0] if gps_first else None,
+                               contaminated, n_samples)
+            with open(f"{base}.sigmf-meta", "w") as fm:
+                json.dump(meta, fm, indent=1)
+        except OSError as exc:
+            meta_err = exc
+        try:
+            catalog.finalize_capture(
+                cap_id, n_samples=n_samples, contaminated=contaminated,
+                smeter_avg=(smeter_sum / smeter_n) if smeter_n else None)
+        except sqlite3.Error as exc:
+            print(f"[capture ch{cs.ch}] {name}: FINALIZE FAILED ({exc!r}); "
+                  f"row {cap_id} left in flight")
         cs.capture_id = None
         print(f"[capture ch{cs.ch}] {name}: {n_samples} samples "
               f"({n_samples / FS_OUT:.1f}s @{FS_OUT}Hz)"
               f"{' STALLED' if reason == 'stall' else ''}"
               f"{' ->rotate' if reason == 'rotate' else ''}"
-              f"{' CONTAMINATED' if contaminated else ''}")
+              f"{' CONTAMINATED' if contaminated else ''}"
+              f"{f' META-FAILED({meta_err!r})' if meta_err else ''}")
     return nxt, reason
 
 
@@ -210,7 +226,12 @@ async def channel_worker(sdr: SdrClient, cs: ChannelState, inbox: asyncio.Queue,
                                                    rotate_s)
             except Exception as exc:           # ConnectionClosed mid-capture etc.
                 backoff = 65 + cs.ch * 7       # decorrelate retries across workers
-                print(f"[capture ch{cs.ch}] stream error ({exc!r}); "
+                # OSError here is the disk, not the radio: the session is
+                # probably fine and the backoff is just waiting out the mount.
+                # Say so — "stream error (FileNotFoundError)" sent us hunting
+                # the SDR for an hour once.
+                kind = "disk error" if isinstance(exc, OSError) else "stream error"
+                print(f"[capture ch{cs.ch}] {kind} ({exc!r}); "
                       f"reconnecting after {backoff}s")
                 session = None
                 self_release(cs, det)
