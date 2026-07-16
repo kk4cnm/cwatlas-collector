@@ -1,2 +1,0 @@
-[console_scripts]
-cwatlas-collector = cwatlas_mcp.runtime:main
