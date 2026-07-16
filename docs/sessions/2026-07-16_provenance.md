@@ -105,6 +105,18 @@ and untracked files are excluded, because neither changes what executed, and a
 flag that trips on an untracked scratch file is a flag you learn to ignore. The
 `.bak` entries were left alone; they were never the problem.
 
+The *real* debris was the mirror image, and review found it: a **tracked
+generated directory**. `cwatlas_collector.egg-info/` is six tracked files that
+setuptools rewrites on every `pip install -e .`, and its `SOURCES.txt` had been
+stale since Jul 4. Since `git_dirty` only sees tracked files, `.venv/` and
+`__pycache__/` were never a factor — but a routine reinstall would rewrite
+`SOURCES.txt`, flip `git_dirty` to 1, and stamp a diff hash on every subsequent
+run for zero semantic change. Untracked now (`1f81701`), and verified the way
+that actually settles it: `git_dirty` is 0 before *and after* a reinstall. This
+is why it mattered rather than being tidiness — the `captures_from_dirty_code`
+health check keys on that flag, and an alarm that trips on routine work is an
+alarm you stop reading within a week.
+
 **`executescript()` would have silently broken the migration.** The plan said
 DDL + backfill + `user_version` land atomically in one `BEGIN IMMEDIATE`. They
 wouldn't have: Python's `executescript` implicitly COMMITs the pending
@@ -131,7 +143,7 @@ there.
 `migrations.py` (a `user_version` mechanism the project didn't have — the old
 `CREATE TABLE IF NOT EXISTS` could create but never alter), `provenance.py`,
 `runs` + `capture_events` + `captures.run_id`, and one reordering in
-`runtime.py`. 28 existing tests unchanged and passing; 18 new.
+`runtime.py`. `capture.py` untouched, exactly as the design promised.
 
 Migration against the live catalog: **52 ms** for 35,186 rows. All adopted by
 the synthetic run, zero left NULL. The dashboard returns byte-identical results
@@ -143,6 +155,74 @@ reconstructed from git log: the window spans many commits with no way to
 attribute a row to one, and a plausible fiction in a provenance table is worse
 than a NULL. `kind='synthetic'` plus a `note` explaining that every NULL means
 *unrecorded, not failed-to-record*.
+
+## 6b. Review found three more things (m2, m3, and the log's writers)
+
+Design review of the above produced four corrections, three of which changed
+code. Worth recording because two of them were cases of *the reviewer being more
+right than they knew*.
+
+**The synthetic envelope wasn't ambiguous — it was wrong.** m1 set
+`ended_utc = MAX(started_utc)`: the last capture's *start*. A capture runs for up
+to `rotate_s` afterwards, so on the live corpus **nine rows ended outside their
+own run's envelope**, by up to 40 s, and `WHERE t BETWEEN started_utc AND
+ended_utc` silently dropped them. m2 corrects it to
+`MAX(COALESCE(ended_utc, started_utc))`, and spells out in the `note` that for
+`kind='synthetic'` the bounds mean observed *activity* across many processes —
+not a process lifetime as they do for `kind='collector'`. Same columns, two
+meanings keyed on `kind`; the row now says which out loud.
+
+**m1 keeps its bug on purpose.** Editing a shipped migration would make the code
+lie about what production actually executed — the one unaffordable class of bug
+in a provenance feature. Fresh DBs run m1 then m2 and land exactly where
+production did.
+
+**The transaction boundary needed to be structural, not source order.**
+`UPDATE captures …; INSERT INTO capture_events …; commit()` *reads* flag-first
+and is wrong: one implicit transaction, so an event failure rolls the flag back
+with it. And the test for it has to reopen the database — an uncommitted UPDATE
+is perfectly visible to the connection that made it, so asserting on the writer
+proves visibility, never durability. `test_flag_is_durable_before_the_event_is_tried`
+reads through a second connection opened while the writer is still open.
+
+A nice accident: `sqlite3.Connection.executemany` is read-only and can't be
+monkeypatched, which forced breaking the log for real — and *that* surfaced that
+the two failure modes exercise different halves of the except path. A missing
+table fails at **prepare** time with no transaction open, which is exactly when
+`execute("ROLLBACK")` raises *"cannot rollback"* over the real error; a trigger
+abort fails **mid-statement** and leaves one open. Both are tested now. The
+except path uses `rollback()`, the method, which no-ops when there's nothing to
+undo.
+
+**Health signals, so a break is visible.** `/api/summary` gained a `provenance`
+panel: `unstamped_captures` and `captures_from_dirty_code` must both be 0;
+`unclean_exits` counts runs killed without unwinding (history, not an error).
+Both queries came out simpler than proposed — `unstamped_captures` needs no
+"since deployment" cutoff *because* the m1 backfill refused to leave NULLs
+behind, and `unclean_exits` needs no current-run id because only one collector
+runs at a time. The honest 8.6 ms `UPDATE` bought an invariant worth alarming on.
+
+**m3 — the last process-level gap.** Same `git_commit`, same `config_sha256`,
+different installed packages. `pip install -U numpy` changes the decimator's
+arithmetic and therefore the IQ bytes, with both fingerprints identical. `runs`
+now records `dependencies_json`/`dependencies_sha256`: what's *installed*, not
+what pyproject declares — requirements are intent (`numpy>=1.26`), the
+environment is reality (**2.5.0**, already a major version past the floor). The
+name set is *derived* from the distribution's own requirements, never curated,
+for the same reason detector defaults are read from the signature: a hand-listed
+set goes stale the first time someone forgets. Direct deps only — numpy and
+websockets have zero runtime deps of their own, while `mcp` drags 17 and is
+dormant under `--no-mcp`. Also `sqlite3`, the linked C library that no pip freeze
+would ever show and that `mark_window`'s `RETURNING` needs ≥3.35 of.
+
+`dsp.py` turns out to pin its dtypes explicitly, so it's well defended against
+numpy 2.0's NEP 50 promotion changes and the risk to the existing corpus is low.
+But that's a property of today's code that nobody recorded — established by
+reading it, not by any run row. From run 4 on, we don't have to be lucky.
+
+A detail that shows the design working: runs 2, 3 and 4 share
+`config_sha256 = ce4c4383` across three different commits. Code changed,
+configuration didn't, and each fingerprint says only what it actually knows.
 
 ## 7. Where this points
 
@@ -171,8 +251,23 @@ The provenance concept grew out of design discussions with ChatGPT ("Morgan")
 during the early CWAtlas architecture work; it's recorded here because the
 *reason* for a design outlives the design.
 
-**Next:** the event log has a schema and no writers. The first ones should be
-contamination attribution (`server.py` already accepts a `reason` for
-agent-reported contamination and `scheduler.py` **silently drops it** — an agent
-says why it flagged 200 captures and the system throws the why away), and
-`backfill_orphans.py` marking reconstructed finalizes as reconstructed.
+**Where it ended up.** Four migrations' worth of work in a day, all deployed:
+`d679149` (runs + the mechanism), `1f81701` (untrack egg-info), `dbf183b` (m2,
+health signals, event writers), `ac61ab0` (m3, dependencies). 78 tests, of the
+original 28 not one needed changing. Live at run 4, `ok: true`, zero errors.
+
+The event log now has writers: contamination from `capture.py` (PTT) and from
+`mark_window` — the latter finally carrying the `reason` that `server.py` had
+always accepted and `scheduler.py` dropped on the floor, so an agent that flags
+200 captures records *why* instead of the system throwing it away. And
+`backfill_orphans` emits `finalize_recovered` with `inferred: true`, so the
+catalog stops presenting rows rebuilt from file mtime and filesize as though
+they'd been observed.
+
+**Next:** `reviewed`, `dataset_added`, `dataset_removed` and `published` have a
+schema and no writers — deliberately. Add the emitter when a consumer exists,
+not before. The remaining known gaps, all documented rather than quietly
+carried: transitive dependency changes are invisible (accepted — `httpx` only
+reads `/status`); an untracked new module that gets imported reads as clean; and
+`captures.sha256` content hashing still isn't there, so the corpus can't detect
+an IQ file changing under it.
