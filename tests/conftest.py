@@ -3,7 +3,7 @@ import time
 
 import pytest
 
-from cwatlas_mcp.catalog import SCHEMA
+from cwatlas_mcp.catalog import SCHEMA, Catalog
 
 NOW = 1_751_500_000.0  # fixed "now" so window edges are deterministic
 
@@ -20,7 +20,13 @@ def _row(*, started_ago_s, dur_s=60.0, band="20m", freq_hz=14_030_000.0,
 
 @pytest.fixture
 def fixture_db(tmp_path):
-    """catalog.db with rows straddling every window edge."""
+    """catalog.db with rows straddling every window edge.
+
+    Built at the v0 baseline and then migrated, which is what the dash always
+    reads in production: the collector migrates catalog.db at startup, before
+    anything else opens it. (Left unmigrated, the provenance panel degrades to
+    {"error": no such column: run_id} and the dash tests assert nothing.)
+    """
     db_path = tmp_path / "catalog.db"
     db = sqlite3.connect(db_path)
     db.executescript(SCHEMA)
@@ -41,4 +47,5 @@ def fixture_db(tmp_path):
         " VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
     db.commit()
     db.close()
+    Catalog(db_path).close()      # v0 -> current; adopts the rows as pre-provenance
     return db_path

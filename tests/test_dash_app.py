@@ -4,7 +4,8 @@ import cwatlas_dash.sources as sources
 from cwatlas_dash.app import create_app
 
 SUMMARY_KEYS = {"generated_at", "service", "sdr", "adc", "totals",
-                "windows", "hourly", "inflight", "solar", "journal"}
+                "windows", "hourly", "inflight", "provenance", "solar",
+                "journal"}
 
 
 @pytest.fixture
@@ -29,6 +30,9 @@ def test_summary_has_all_panels(client):
     assert len(data["hourly"]) == 24
     assert data["sdr"] == {"gps": "good"}
     assert data["adc"] == {"ov_mask": "0"}
+    # a real panel, not a degraded {"error": ...} that would assert nothing
+    assert data["provenance"]["ok"] is True
+    assert data["provenance"]["unstamped_captures"] == 0
 
 
 def test_summary_degrades_per_source(client, monkeypatch):

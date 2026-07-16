@@ -101,3 +101,28 @@ def test_samples_recorded_despite_sidecar_failure(rig, monkeypatch):
         "SELECT n_samples, ended_utc FROM captures").fetchone()
     assert ended is not None
     assert n_samples > 0
+
+
+def test_provenance_failure_costs_neither_the_row_nor_the_flag(rig):
+    """Provenance did not widen the hole this file exists to guard.
+
+    mark_contaminated runs inside the write loop. With the event log broken, the
+    capture must still finalize (no orphan) AND the contamination flag must
+    still land — the flag is what keeps dirty IQ out of the training set; the
+    event is only a note about it. Hygiene beats provenance.
+    """
+    catalog, det, cs, data_dir = rig
+    cs.contaminated = True                  # PTT asserted mid-capture
+    catalog._db.execute(
+        "CREATE TRIGGER _boom BEFORE INSERT ON capture_events "
+        "BEGIN SELECT RAISE(ABORT,'disk I/O error'); END")
+    catalog._db.commit()
+
+    _, reason = _run(catalog, det, cs, data_dir)
+
+    assert reason == "stall"                        # error did not escape
+    assert _inflight(data_dir / "catalog.db") == 0  # row closed
+    assert cs.capture_id is None
+    db = sqlite3.connect(data_dir / "catalog.db")
+    assert db.execute("SELECT contaminated FROM captures").fetchone()[0] == 1
+    assert db.execute("SELECT COUNT(*) FROM capture_events").fetchone()[0] == 0

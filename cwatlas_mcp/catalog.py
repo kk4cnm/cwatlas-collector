@@ -13,6 +13,7 @@ migrations.py; see the note there.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from pathlib import Path
@@ -112,20 +113,82 @@ class Catalog:
             (time.time(), n_samples, int(contaminated), smeter_avg, cap_id))
         self._db.commit()
 
-    def mark_contaminated(self, cap_id: int) -> None:
+    def mark_contaminated(self, cap_id: int, *, actor: str = "collector",
+                          details: dict | None = None) -> None:
+        """Latch the contamination flag, then record who said so and why.
+
+        ORDERING IS LOAD-BEARING — see add_events(). The flag is committed on its
+        own before the event is attempted; the two must never share a
+        transaction.
+        """
         self._db.execute(
             "UPDATE captures SET contaminated=1 WHERE id=?", (cap_id,))
-        self._db.commit()
+        self._db.commit()          # <-- the boundary: the flag is durable HERE
+        self.add_events([cap_id], "contaminated", actor, details)
 
-    def mark_window(self, start_ts: float, end_ts: float) -> int:
+    def mark_window(self, start_ts: float, end_ts: float, *,
+                    actor: str = "agent", reason: str | None = None) -> int:
         """Flag every capture whose recording overlaps [start_ts, end_ts]
-        (agent-reported contamination, e.g. a TX the PTT ingest missed)."""
-        cur = self._db.execute(
+        (agent-reported contamination, e.g. a TX the PTT ingest missed).
+
+        -> the number of captures NEWLY flagged.
+        """
+        # `AND contaminated=0` so re-running a window doesn't re-emit an event
+        # for rows already flagged (and so the count means "newly flagged"
+        # rather than "matched"). RETURNING needs sqlite >= 3.35; this host is
+        # 3.37. rowcount is unreliable with RETURNING — count the rows instead.
+        rows = self._db.execute(
             "UPDATE captures SET contaminated=1 WHERE started_utc <= ?"
-            " AND COALESCE(ended_utc, strftime('%s','now')) >= ?",
-            (end_ts, start_ts))
-        self._db.commit()
-        return cur.rowcount
+            " AND COALESCE(ended_utc, strftime('%s','now')) >= ?"
+            " AND contaminated=0 RETURNING id", (end_ts, start_ts)).fetchall()
+        self._db.commit()          # <-- flags durable before any event is tried
+        cap_ids = [r[0] for r in rows]
+        self.add_events(cap_ids, "contaminated", actor,
+                        {"reason": reason, "window": [start_ts, end_ts]})
+        return len(cap_ids)
+
+    def add_events(self, cap_ids: list[int], event_type: str, actor: str,
+                   details: dict | None = None) -> int:
+        """Append to the immutable log, best-effort. -> events written.
+
+        BEST-EFFORT ON PURPOSE. Provenance must never stop collection, and it
+        must never cost us a fact the catalog itself is carrying. Two rules
+        follow, and both are easy to "clean up" into bugs:
+
+        1. This can only ever print. mark_contaminated is called from inside
+           capture.py's write loop; raising here would surface as a stream error
+           and buy a 65 s reconnect backoff — trading dead radio time for a
+           provenance hiccup.
+
+        2. Callers MUST commit the state change BEFORE calling this, in a
+           separate transaction. Never write `UPDATE captures ...; INSERT INTO
+           capture_events ...; commit()` — the source reads flag-first but it is
+           ONE implicit transaction, so an event failure rolls the flag back
+           with it. The flag is what keeps contaminated IQ out of the training
+           set; the event is a note about the flag. Losing the note is an
+           annoyance, losing the flag is a poisoned corpus. HYGIENE BEATS
+           PROVENANCE: a crash between the two commits is the correct outcome.
+        """
+        if not cap_ids:
+            return 0
+        blob = json.dumps(details, sort_keys=True) if details else None
+        ts = time.time()
+        try:
+            self._db.executemany(
+                "INSERT INTO capture_events (capture_id, ts, event_type, actor,"
+                " run_id, details_json) VALUES (?,?,?,?,?,?)",
+                [(c, ts, event_type, actor, self._run_id, blob) for c in cap_ids])
+            self._db.commit()
+        except sqlite3.Error as exc:
+            # rollback() the METHOD, not execute("ROLLBACK"): if the INSERT died
+            # before its implicit BEGIN there is no transaction, and the
+            # statement form raises "cannot rollback - no transaction is active"
+            # right over the top of the real error. The method is a no-op.
+            self._db.rollback()
+            print(f"[catalog] {event_type} event for {len(cap_ids)} capture(s) "
+                  f"NOT recorded ({exc!r}); the capture rows are unaffected")
+            return 0
+        return len(cap_ids)
 
     def window_stats(self, since_ts: float) -> dict:
         """Coverage/throughput summary for the MCP get_collection_stats tool."""

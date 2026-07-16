@@ -1,4 +1,4 @@
-"""The migration mechanism, and migration 1 (provenance).
+"""The migration mechanism, and the migrations themselves.
 
 The load-bearing case is a v0 DB with 35k live rows in it — so these tests care
 most about two things: that a v0 DB comes out the other side with every capture
@@ -34,6 +34,10 @@ def _cols(db, table):
     return {r[1] for r in db.execute(f"PRAGMA table_info({table})")}
 
 
+# tracked rather than hardcoded, so adding a migration doesn't break every test
+CURRENT_VERSION = len(migrations.MIGRATIONS)
+
+
 def test_v0_migrates_and_adopts_every_capture(tmp_path):
     path = tmp_path / "catalog.db"
     _v0_db(path, n_rows=3)
@@ -43,7 +47,7 @@ def test_v0_migrates_and_adopts_every_capture(tmp_path):
     Catalog(path).close()
 
     db = sqlite3.connect(path)
-    assert db.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert db.execute("PRAGMA user_version").fetchone()[0] == CURRENT_VERSION
     assert "run_id" in _cols(db, "captures")
     # no capture is left ambiguous between "collected before provenance" and
     # "the stamping is broken"
@@ -57,9 +61,67 @@ def test_v0_migrates_and_adopts_every_capture(tmp_path):
     assert config_json is None          # never recorded, and not invented
     assert "UNRECORDED" in note
     # the synthetic run's span is the captures it covers, read from the data
-    lo, hi = db.execute("SELECT MIN(started_utc), MAX(started_utc)"
+    lo, hi = db.execute("SELECT MIN(started_utc), MAX(ended_utc)"
                         " FROM captures").fetchone()
     assert (started, ended) == (lo, hi)
+
+
+def test_synthetic_envelope_covers_captures_that_end_after_the_last_start(tmp_path):
+    """m1 bounded the run with MAX(started_utc) — the last capture's START, not
+    its end. Captures still recording end after that, and were falling outside
+    their own run's envelope (9 did on the live corpus, by up to 40 s)."""
+    path = tmp_path / "catalog.db"
+    db = sqlite3.connect(path)
+    db.executescript(SCHEMA)
+    # the last capture to START is short; an earlier, longer one ends much later
+    db.executemany(
+        "INSERT INTO captures (freq_hz, band, started_utc, ended_utc, n_samples,"
+        " srate_hz, path, strength_db, keyed_conf, contaminated)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?)",
+        [_row(started_ago_s=1000, dur_s=600.0),    # starts first, ends at -400
+         _row(started_ago_s=500, dur_s=600.0)])    # starts last, ends at +100
+    db.commit()
+    db.close()
+
+    Catalog(path).close()
+
+    db = sqlite3.connect(path)
+    started, ended, note = db.execute(
+        "SELECT started_utc, ended_utc, note FROM runs WHERE kind='synthetic'"
+    ).fetchone()
+    lo, hi = db.execute(
+        "SELECT MIN(started_utc), MAX(ended_utc) FROM captures").fetchone()
+    assert (started, ended) == (lo, hi)
+    # the whole point: no capture falls outside its own run's envelope
+    assert db.execute(
+        "SELECT COUNT(*) FROM captures c JOIN runs r ON c.run_id=r.id"
+        " WHERE c.ended_utc > r.ended_utc").fetchone()[0] == 0
+    # and the overloaded columns say which meaning they carry
+    assert "do NOT represent the lifetime of a single historical collector" in note
+
+
+def test_synthetic_envelope_handles_a_capture_orphaned_in_flight(tmp_path):
+    """An in-flight row has no ended_utc; its start is then the honest bound."""
+    path = tmp_path / "catalog.db"
+    db = sqlite3.connect(path)
+    db.executescript(SCHEMA)
+    db.executemany(
+        "INSERT INTO captures (freq_hz, band, started_utc, ended_utc, n_samples,"
+        " srate_hz, path, strength_db, keyed_conf, contaminated)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?)",
+        [_row(started_ago_s=1000, dur_s=100.0),
+         _row(started_ago_s=200, in_flight=True)])   # ended_utc IS NULL
+    db.commit()
+    db.close()
+
+    Catalog(path).close()
+
+    db = sqlite3.connect(path)
+    ended = db.execute("SELECT ended_utc FROM runs WHERE kind='synthetic'"
+                       ).fetchone()[0]
+    assert ended is not None                        # COALESCE, not a NULL max
+    assert ended == db.execute("SELECT MAX(started_utc) FROM captures"
+                               ).fetchone()[0]
 
 
 def test_fresh_db_migrates_with_no_synthetic_run(tmp_path):
@@ -68,7 +130,7 @@ def test_fresh_db_migrates_with_no_synthetic_run(tmp_path):
     Catalog(tmp_path / "catalog.db").close()
 
     db = sqlite3.connect(tmp_path / "catalog.db")
-    assert db.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert db.execute("PRAGMA user_version").fetchone()[0] == CURRENT_VERSION
     assert "run_id" in _cols(db, "captures")
     assert db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
 
@@ -80,7 +142,7 @@ def test_migration_is_idempotent(tmp_path):
     Catalog(path).close()          # re-running SCHEMA + migrate must be a no-op
 
     db = sqlite3.connect(path)
-    assert db.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert db.execute("PRAGMA user_version").fetchone()[0] == CURRENT_VERSION
     assert db.execute("SELECT COUNT(*) FROM runs WHERE kind='synthetic'"
                       ).fetchone()[0] == 1
 
@@ -116,14 +178,14 @@ def test_failed_migration_rolls_back_to_clean_v0(tmp_path, monkeypatch):
 def test_concurrent_opens_migrate_once(tmp_path):
     """Two collectors starting at once must not both migrate. BEGIN IMMEDIATE
     takes the write lock before user_version is read, so the loser blocks and
-    then sees v1."""
+    then sees the migrated version."""
     path = tmp_path / "catalog.db"
     _v0_db(path, n_rows=3)
 
     a, b = Catalog(path), Catalog(path)
     try:
         db = sqlite3.connect(path)
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert db.execute("PRAGMA user_version").fetchone()[0] == CURRENT_VERSION
         assert db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
     finally:
         a.close()

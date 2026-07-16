@@ -69,6 +69,7 @@ def create_app(**overrides) -> Flask:
                             for w in sources.WINDOWS},
                 "hourly": _guard(sources.hourly_buckets, db_path=db),
                 "inflight": _guard(sources.inflight, db_path=db),
+                "provenance": _guard(sources.provenance_health, db_path=db),
                 "solar": _guard(sources.solar_priorities, c["LAT"], c["LON"]),
                 "journal": _guard(sources.journal_tail, c["UNIT"]),
             }

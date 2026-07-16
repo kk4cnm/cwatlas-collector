@@ -74,6 +74,62 @@ def totals(db_path: Path | None = None) -> dict:
             "iq_hours": round(row[4] / 3600.0, 2)}
 
 
+def provenance_health(db_path: Path | None = None) -> dict:
+    """Instrument-health signals derived from the provenance tables.
+
+    These turn otherwise-silent regressions into visible ones. Each is a count
+    that should be 0 in a healthy production corpus, plus the context needed to
+    read it — see docs/provenance.md.
+    """
+    with closing(_connect(db_path)) as db:
+        # An INTEGRATION REGRESSION. The m1 backfill adopted every pre-existing
+        # capture into the synthetic run, and begin_run stamps every new one, so
+        # there is no legitimate NULL anywhere in the corpus — past or future.
+        # Nothing in production inserts captures except start_capture
+        # (backfill_orphans only UPDATEs). A NULL here means the collector wrote
+        # a capture without declaring a run: provenance is silently broken.
+        # NB this needs no "since deployment" cutoff precisely because the
+        # backfill refused to leave NULLs behind.
+        unstamped = db.execute(
+            "SELECT COUNT(*) FROM captures WHERE run_id IS NULL").fetchone()[0]
+
+        # NOT AN ERROR, but operationally interesting: a run with no ended_utc
+        # died without unwinding (SIGKILL, OOM, power). Only one collector runs
+        # at a time, so any run that isn't the newest is unambiguously dead —
+        # the newest one is either running right now or died, and `service`
+        # in the same payload already says which.
+        unclean = db.execute(
+            "SELECT COUNT(*) FROM runs WHERE kind='collector'"
+            " AND ended_utc IS NULL"
+            " AND id < (SELECT MAX(id) FROM runs WHERE kind='collector')"
+        ).fetchone()[0]
+
+        # THE ONE THAT MATTERS MOST. Non-zero means IQ in the corpus came from
+        # code that exists nowhere in git — unreproducible by construction, and
+        # unfixable after the fact.
+        from_dirty = db.execute(
+            "SELECT COUNT(*) FROM captures c JOIN runs r ON c.run_id = r.id"
+            " WHERE r.git_dirty = 1").fetchone()[0]
+
+        current = db.execute(
+            "SELECT id, git_commit, git_dirty, sdr_firmware, config_sha256"
+            " FROM runs WHERE kind='collector' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+    return {
+        "unstamped_captures": unstamped,
+        "unclean_exits": unclean,
+        "captures_from_dirty_code": from_dirty,
+        "ok": unstamped == 0 and from_dirty == 0,
+        "current_run": ({"id": current[0],
+                         "git_commit": (current[1] or "")[:7] or None,
+                         "git_dirty": bool(current[2]),
+                         "sdr_firmware": current[3],
+                         "config_sha256": (current[4] or "")[:8] or None}
+                        if current else None),
+    }
+
+
 def hourly_buckets(db_path: Path | None = None, hours: int = 24,
                    now: float | None = None) -> list[dict]:
     """Capture-rate buckets for the last `hours` hours, oldest first."""

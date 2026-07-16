@@ -104,6 +104,18 @@ _LEGACY_NOTE = (
     "UNRECORDED, not failed-to-record. Do not backfill it with a guess."
 )
 
+# m2 replaces _LEGACY_NOTE. For kind='collector', started_utc/ended_utc are one
+# process's lifetime; for kind='synthetic' they are an envelope over captures
+# many processes made. Same columns, two meanings keyed on kind — so the row has
+# to say which out loud.
+_LEGACY_NOTE_V2 = _LEGACY_NOTE + (
+    " SEMANTICS: started_utc is the earliest observed capture start and "
+    "ended_utc the latest observed capture end; together they bound observed "
+    "capture ACTIVITY. Unlike a kind='collector' row, they do NOT represent the "
+    "lifetime of a single historical collector process — many processes started "
+    "and exited inside this window, and their boundaries are unrecorded."
+)
+
 
 def _m1_provenance(db: sqlite3.Connection) -> None:
     for stmt in _M1_DDL:
@@ -120,6 +132,13 @@ def _m1_provenance(db: sqlite3.Connection) -> None:
     # aggregate SELECT still returns one all-NULL row on an empty table (-> NOT
     # NULL constraint failed on a fresh install), and HAVING without GROUP BY is
     # rejected.
+    #
+    # NB the MAX(started_utc) below is WRONG as an envelope — it's the last
+    # capture's START, so captures that were still recording end after it (9 of
+    # them did, by up to 40 s, on the live corpus). _m2_synthetic_envelope fixes
+    # it. Left as it ran on purpose: a migration is history, and rewriting this
+    # one would make the code lie about what production actually executed. A
+    # fresh DB runs m1 then m2 and lands in the same place.
     n, lo, hi = db.execute(
         "SELECT COUNT(*), MIN(started_utc), MAX(started_utc) FROM captures"
     ).fetchone()
@@ -131,7 +150,27 @@ def _m1_provenance(db: sqlite3.Connection) -> None:
                    (cur.lastrowid,))
 
 
-MIGRATIONS = [_m1_provenance]      # index i -> user_version i+1
+def _m2_synthetic_envelope(db: sqlite3.Connection) -> None:
+    """Correct the synthetic run's ended_utc, and say what the bounds mean.
+
+    m1 set ended_utc = MAX(started_utc), the latest capture START. A capture
+    runs for up to rotate_s after it starts, so real captures end AFTER that
+    bound: `WHERE t BETWEEN started_utc AND ended_utc` silently dropped them.
+    The envelope is MAX(COALESCE(ended_utc, started_utc)) — COALESCE because a
+    row orphaned in flight has no end, and its start is then the best honest
+    bound we have for it.
+    """
+    for run_id, in db.execute("SELECT id FROM runs WHERE kind='synthetic'"):
+        row = db.execute(
+            "SELECT MIN(started_utc), MAX(COALESCE(ended_utc, started_utc))"
+            " FROM captures WHERE run_id=?", (run_id,)).fetchone()
+        if row[0] is None:      # a synthetic run adopting nothing shouldn't
+            continue            # exist, but don't NULL its NOT NULL column
+        db.execute("UPDATE runs SET started_utc=?, ended_utc=?, note=? WHERE id=?",
+                   (row[0], row[1], _LEGACY_NOTE_V2, run_id))
+
+
+MIGRATIONS = [_m1_provenance, _m2_synthetic_envelope]   # index i -> user_version i+1
 
 
 def migrate(db: sqlite3.Connection) -> int:

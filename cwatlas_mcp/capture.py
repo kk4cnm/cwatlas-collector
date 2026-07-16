@@ -130,7 +130,13 @@ async def _write_capture(session: IqSession, cs: ChannelState,
                     catalog.set_gps_start(cap_id, *gps_first)
                 if cs.contaminated and not contaminated:
                     contaminated = True        # operator TX overlapped this file
-                    catalog.mark_contaminated(cap_id)
+                    # commits the flag, then best-effort logs the event; it
+                    # cannot raise (see Catalog.add_events), so the write loop
+                    # can't lose a capture over a provenance hiccup
+                    catalog.mark_contaminated(
+                        cap_id, actor="collector",
+                        details={"source": "ptt", "ch": cs.ch,
+                                 "elapsed_s": round(time.time() - started, 1)})
                 if time.time() - last_ka > KEEPALIVE_EVERY_S:
                     await session.ws.send("SET keepalive")
                     last_ka = time.time()

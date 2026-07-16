@@ -125,6 +125,7 @@ def main() -> int:
         print(f"\n{len(plan)} row(s) would be closed. Re-run with --apply.")
         return 0
 
+    closed = []
     for r, n_samples, ended in plan:
         meta_path = Path(f"{r['path']}.sigmf-meta")
         if not meta_path.exists():
@@ -132,13 +133,50 @@ def main() -> int:
             with open(tmp, "w") as fm:      # atomic: never a half-written sidecar
                 json.dump(_meta(r, n_samples), fm, indent=1)
             os.replace(tmp, meta_path)
-        db.execute(
+        cur = db.execute(
             "UPDATE captures SET ended_utc=?, n_samples=? WHERE id=?"
             " AND ended_utc IS NULL",       # re-check: don't race a live worker
             (ended, n_samples, r["id"]))
-    db.commit()
+        if cur.rowcount:                    # skip rows a live worker just closed
+            closed.append((r["id"], n_samples, ended))
+    db.commit()          # rows are closed and durable BEFORE any event is tried
+
+    # The values just written are INFERRED — ended_utc from the file's mtime,
+    # n_samples from its size — and the resulting row is identical in shape to an
+    # honestly-finalized one. The sidecar carries "cwatlas:recovered": true but
+    # the catalog row does not, so without this the corpus cannot distinguish an
+    # observed finalize from a reconstructed one. Best-effort and last: the rows
+    # are already closed, and that is the part that matters.
+    _record_recoveries(db, closed)
+
     print(f"\nclosed {len(plan)} row(s)")
     return 0
+
+
+def _record_recoveries(db: sqlite3.Connection, closed: list) -> None:
+    """Log each reconstruction as a reconstruction. Never raises: a missing
+    event must not make a recovery script fail after it has already recovered."""
+    if not closed:
+        return
+    try:
+        db.executemany(
+            "INSERT INTO capture_events (capture_id, ts, event_type, actor,"
+            " details_json) VALUES (?,?,?,?,?)",
+            [(cap_id, time.time(), "finalize_recovered",
+              "script:backfill_orphans",
+              json.dumps({"ended_utc_source": "file_mtime",
+                          "n_samples_source": "filesize",
+                          "inferred": True,
+                          "ended_utc": ended, "n_samples": n_samples},
+                         sort_keys=True))
+             for cap_id, n_samples, ended in closed])
+        db.commit()
+        print(f"recorded {len(closed)} finalize_recovered event(s)")
+    except sqlite3.Error as exc:
+        db.rollback()
+        print(f"WARNING: rows closed, but finalize_recovered events NOT "
+              f"recorded ({exc!r}). These rows now read as normally-finalized; "
+              f"ids: {', '.join(str(c[0]) for c in closed)}")
 
 
 if __name__ == "__main__":

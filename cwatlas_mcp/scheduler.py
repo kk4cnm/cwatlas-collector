@@ -184,8 +184,17 @@ class Supervisor:
             elif n.kind == "notify_tx":
                 self.set_tx(bool(n.payload["active"]))
             elif n.kind == "mark_contaminated" and self.catalog is not None:
-                self.catalog.mark_window(n.payload["start_ts"],
-                                         n.payload["end_ts"])
+                # `reason` is the agent's justification for retroactively
+                # flagging an unbounded number of captures. It used to stop
+                # here; now it lands in the event log with the flag.
+                n_hit = self.catalog.mark_window(
+                    n.payload["start_ts"], n.payload["end_ts"],
+                    actor="agent:mark_window_contaminated",
+                    reason=n.payload.get("reason"))
+                print(f"[supervisor] contamination window "
+                      f"{n.payload['start_ts']:.0f}..{n.payload['end_ts']:.0f}: "
+                      f"{n_hit} capture(s) flagged "
+                      f"(reason: {n.payload.get('reason') or 'unstated'})")
             # unknown kinds ignored on purpose (forward-compatible)
 
     def _pin(self, n: Nudge) -> None:
