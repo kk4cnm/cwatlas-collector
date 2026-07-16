@@ -124,6 +124,26 @@ def test_synthetic_envelope_handles_a_capture_orphaned_in_flight(tmp_path):
                                ).fetchone()[0]
 
 
+def test_m3_leaves_pre_existing_runs_an_honest_null(tmp_path):
+    """A run that predates dependency capture ran under versions nobody
+    recorded. The venv only shows what's installed NOW, so they aren't
+    reconstructible — NULL, not a plausible guess."""
+    path = tmp_path / "catalog.db"
+    _v0_db(path, n_rows=2)
+    db = sqlite3.connect(path)
+    db.executescript(SCHEMA)
+    db.close()
+
+    Catalog(path).close()
+
+    db = sqlite3.connect(path)
+    assert {"dependencies_json", "dependencies_sha256"} <= _cols(db, "runs")
+    # the synthetic run m1 created, now carried forward through m3
+    assert db.execute(
+        "SELECT dependencies_json FROM runs WHERE kind='synthetic'"
+    ).fetchone()[0] is None
+
+
 def test_fresh_db_migrates_with_no_synthetic_run(tmp_path):
     """The empty-table case: a bare aggregate SELECT still yields one all-NULL
     row, so a SQL-side backfill would insert a NOT NULL violation here."""

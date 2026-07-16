@@ -170,7 +170,26 @@ def _m2_synthetic_envelope(db: sqlite3.Connection) -> None:
                    (row[0], row[1], _LEGACY_NOTE_V2, run_id))
 
 
-MIGRATIONS = [_m1_provenance, _m2_synthetic_envelope]   # index i -> user_version i+1
+def _m3_dependencies(db: sqlite3.Connection) -> None:
+    """Record the installed dependency versions a run ran against.
+
+    git_commit and config_sha256 together still couldn't answer "what did the
+    decimator's arithmetic actually do?": `pip install -U numpy` changes the IQ
+    on disk while leaving both fingerprints identical. dsp.py pins its dtypes
+    explicitly so it's well defended against numpy 2.0's promotion changes — but
+    that is a property of today's code that nobody recorded, not a guarantee.
+
+    Existing runs get NULL: the versions they ran under were never recorded and
+    are not reconstructible from the venv's current state (which only shows what
+    is installed NOW). Same rule as the synthetic run — an honest gap, not a
+    plausible guess.
+    """
+    db.execute("ALTER TABLE runs ADD COLUMN dependencies_json TEXT")
+    db.execute("ALTER TABLE runs ADD COLUMN dependencies_sha256 TEXT")
+
+
+MIGRATIONS = [_m1_provenance, _m2_synthetic_envelope, _m3_dependencies]
+# index i -> user_version i+1
 
 
 def migrate(db: sqlite3.Connection) -> int:

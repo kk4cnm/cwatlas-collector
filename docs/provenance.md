@@ -51,6 +51,8 @@ Written once at startup by `Catalog.begin_run()` from
 | `sdr_firmware` / `sdr_rx_chans` | from the device's MSG config at connect |
 | `config_json` | the **effective, resolved** config, verbatim |
 | `config_sha256` | grouping key over `config_json` |
+| `dependencies_json` | installed versions of the runtime deps + the sqlite C library |
+| `dependencies_sha256` | grouping key over `dependencies_json` |
 | `note` | prose; carries the synthetic run's explanation |
 
 `config_json` holds `scheduler` (including the hardware-derived
@@ -77,6 +79,55 @@ every threshold hash is unchanged. A commit cannot see hardware-derived or
 CLI-supplied values, which vary with no source change at all. Neither is a
 substitute for the other, and a hand-bumped version string is a substitute for
 neither: it lies the first time someone tunes a constant and forgets.
+
+### Dependencies: intent vs. reality
+
+A third fingerprint, because the first two share a blind spot: **same
+`git_commit`, same `config_sha256`, different installed packages.** `pip install
+-U numpy` changes the decimator's arithmetic — and therefore the IQ bytes on
+disk — with both existing fingerprints identical.
+
+`dependencies_json` records what was *installed*, not what pyproject *asked
+for*. Declared requirements describe intent (`numpy>=1.26`); only the
+environment knows reality (`2.5.0`). The distinction is not academic here: the
+installed numpy is a major version past the declared floor, so the environment
+crossed the 1.x→2.x boundary at some point no run row can name. `dsp.py` pins
+its dtypes explicitly (`.astype(np.float32)`, `.astype(np.complex64)`) so it is
+well defended against numpy 2.0's NEP 50 promotion changes — but that is a
+property of today's code that nobody recorded, not a guarantee anyone can rely
+on for the next upgrade.
+
+Two rules keep the set honest and bounded:
+
+- **The names are derived, never curated.** `_declared_runtime_packages()` reads
+  the distribution's own requirements, so adding a dependency to pyproject puts
+  it in provenance with nobody remembering to. A hand-listed set is maintainable
+  state that goes stale — the same failure mode as retyping detector thresholds
+  instead of reading the signature.
+- **Direct requirements only, extras excluded.** `numpy` and `websockets` — the
+  two that shape the corpus (decimator math; the IQ stream itself) — have *zero*
+  runtime deps, so direct capture covers their whole surface. `mcp` drags 17 and
+  is dormant in production under `--no-mcp`; hashing that tree would churn the
+  fingerprint on code that never runs. `dev` (pytest/ruff) and `dash`
+  (flask/otel) cannot touch the corpus.
+
+The known gap: a *transitive* change (say `httpcore` under `httpx`) is invisible.
+That's a deliberate trade — `httpx` only reads `/status`, and it doesn't touch
+the IQ.
+
+`sqlite3` is in there too, nested under its own key rather than mixed in with
+`packages`, because it isn't a pip distribution and pretending otherwise is the
+kind of small lie that costs somebody an hour in 2031. It's a real dependency —
+`mark_window`'s `RETURNING` needs ≥ 3.35 — that no pip freeze would ever show and
+that an OS upgrade moves silently.
+
+```sql
+SELECT json_extract(dependencies_json, '$.packages.numpy') AS numpy,
+       json_extract(dependencies_json, '$.sqlite3')        AS sqlite,
+       COUNT(c.id) AS captures
+FROM runs r JOIN captures c ON c.run_id = r.id
+GROUP BY r.dependencies_sha256;
+```
 
 ## `capture_events` — what happened since
 
@@ -265,8 +316,8 @@ of it. This is a restoration.
 
 **Not done, deliberately:** `PRAGMA foreign_keys=ON`; emitters for review /
 dataset membership / publication (the schema is ready — write them when a
-consumer exists); `captures.sha256` content hashing; any general-purpose
-provenance framework.
+consumer exists); `captures.sha256` content hashing; transitive dependency
+capture (see above); any general-purpose environment-capture framework.
 
 The concept grew out of design discussions with ChatGPT ("Morgan") during the
 early CWAtlas architecture work.

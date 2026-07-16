@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
+from importlib.metadata import version
 
 from cwatlas_mcp import provenance
 from cwatlas_mcp.catalog import Catalog
@@ -70,6 +72,75 @@ def test_unset_lat_lon_is_null_not_nan():
                                       _cfg(), SEARCH_PLAN)
     assert cfg["args"]["lat"] is None
     json.loads(json.dumps(cfg))     # must round-trip
+
+
+# ---- dependencies -----------------------------------------------------------
+
+def test_declared_packages_are_derived_from_pyproject_not_curated():
+    """The name set must come from the distribution's own metadata, so adding a
+    dependency puts it in provenance with nobody remembering to."""
+    names = provenance._declared_runtime_packages()
+    assert names == sorted(names)
+    assert {"numpy", "websockets", "httpx", "mcp"} <= set(names)
+
+
+def test_extras_are_excluded():
+    """dev (pytest/ruff) and dash (flask/otel) aren't the collector's runtime
+    and cannot touch the corpus."""
+    names = set(provenance._declared_runtime_packages())
+    assert not (names & {"pytest", "ruff", "flask", "opentelemetry-api",
+                         "pytest-asyncio"})
+
+
+def test_dependency_versions_are_read_from_the_environment():
+    """Declared requirements are intent ("numpy>=1.26"); this is reality."""
+    deps = provenance.dependency_versions()
+    assert deps["packages"]["numpy"] is not None
+    assert not deps["packages"]["numpy"].startswith(">=")     # a version, not a spec
+    # the linked C library: no pip freeze would ever show it, and mark_window's
+    # RETURNING depends on it being >= 3.35
+    assert deps["sqlite3"] == sqlite3.sqlite_version
+
+
+def test_a_declared_but_uninstalled_package_is_null_not_a_guess(monkeypatch):
+    monkeypatch.setattr(provenance, "_declared_runtime_packages",
+                        lambda: ["numpy", "definitely-not-installed"])
+    deps = provenance.dependency_versions()
+    assert deps["packages"]["definitely-not-installed"] is None
+    assert deps["packages"]["numpy"] is not None
+
+
+def test_unknown_distribution_does_not_raise(monkeypatch):
+    """Provenance runs at startup; it must never be able to kill the collector."""
+    assert provenance._declared_runtime_packages("no-such-dist-xyz") == []
+
+
+def test_dependencies_sha256_is_stable_and_tracks_every_version():
+    two_x = {"packages": {"numpy": "2.5.0"}, "sqlite3": "3.37.2"}
+    same = {"sqlite3": "3.37.2", "packages": {"numpy": "2.5.0"}}   # key order
+    one_x = {"packages": {"numpy": "1.26.0"}, "sqlite3": "3.37.2"}
+    old_sqlite = {"packages": {"numpy": "2.5.0"}, "sqlite3": "3.34.0"}
+
+    h = provenance.dependencies_sha256
+    assert h(two_x) == h(same)          # canonical: content, not insertion order
+    assert h(two_x) != h(one_x)         # the numpy major-version boundary
+    assert h(two_x) != h(old_sqlite)    # and the C library nothing else records
+
+
+def test_run_records_dependencies(tmp_path):
+    cat = Catalog(tmp_path / "catalog.db")
+    try:
+        run_id = cat.begin_run(
+            provenance.build_run_info(_args(), DEV, _cfg(), SEARCH_PLAN))
+        blob, sha = cat._db.execute(
+            "SELECT dependencies_json, dependencies_sha256 FROM runs WHERE id=?",
+            (run_id,)).fetchone()
+        deps = json.loads(blob)
+        assert deps["packages"]["numpy"] == version("numpy")   # what actually ran
+        assert deps["sqlite3"] == sqlite3.sqlite_version
+        assert len(sha) == 64
+    finally:
+        cat.close()
 
 
 # ---- git state --------------------------------------------------------------

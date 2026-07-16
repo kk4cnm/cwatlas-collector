@@ -22,15 +22,20 @@ import inspect
 import json
 import os
 import platform
+import re
 import socket
+import sqlite3
 import subprocess
 import time
+from importlib.metadata import PackageNotFoundError, requires, version
 from pathlib import Path
 
 from . import __version__
 from .detector import detect_cw
 from .dsp import CARRIER_OUT_HZ, DECIM, FS_IN, FS_OUT
 from .solar import BAND_WEIGHTS
+
+DIST = "cwatlas-collector"
 
 # The package is installed editable (pip install -e .), so the source tree IS the
 # checkout and its parent is the repo root. Deploys are `git pull` + restart with
@@ -83,6 +88,60 @@ def git_state() -> dict:
     }
 
 
+def _declared_runtime_packages(dist: str = DIST) -> list[str]:
+    """The distribution's own runtime requirements, by name.
+
+    Derived, not curated: pyproject decides WHICH packages are relevant, so
+    adding a dependency puts it in provenance without anyone remembering to.
+    A hand-listed set is maintainable state that goes stale — the same failure
+    as retyping detector thresholds instead of reading the signature.
+
+    Extras are excluded: dev (pytest/ruff) and dash (flask/otel) are not the
+    collector's runtime and none of them can touch the corpus.
+    """
+    try:
+        reqs = requires(dist) or []
+    except PackageNotFoundError:
+        return []
+    names = []
+    for req in reqs:
+        spec, _, marker = req.partition(";")
+        if "extra" in marker:
+            continue
+        m = re.match(r"[A-Za-z0-9._-]+", spec.strip())
+        if m:
+            names.append(m.group(0))
+    return sorted(names)
+
+
+def dependency_versions() -> dict:
+    """What's actually installed, as opposed to what pyproject asked for.
+
+    Declared requirements describe intent ("numpy>=1.26"); this describes
+    reality ("2.5.0"). The gap matters: `pip install -U numpy` changes the
+    decimator's arithmetic — and therefore the IQ on disk — while git_commit and
+    config_sha256 both stay put. Direct requirements only: numpy and websockets,
+    the two that shape the corpus, have no runtime deps of their own, while mcp
+    drags 17 and is dormant in production under --no-mcp. Hashing that tree would
+    churn on code that never runs.
+    """
+    packages: dict[str, str | None] = {}
+    for name in _declared_runtime_packages():
+        try:
+            packages[name] = version(name)
+        except PackageNotFoundError:
+            packages[name] = None       # declared but absent: an honest gap
+    return {
+        "packages": packages,
+        # The linked C library, NOT a pip distribution — no freeze would ever
+        # show it, and an OS upgrade moves it silently. It's a real dependency:
+        # mark_window's RETURNING needs >= 3.35. Nested under its own key rather
+        # than mixed in with `packages`, which would be a small lie about what
+        # kind of thing it is.
+        "sqlite3": sqlite3.sqlite_version,
+    }
+
+
 def _defaults_of(fn) -> dict:
     """Keyword defaults of a function, read from the signature.
 
@@ -123,12 +182,21 @@ def effective_config(args, cfg, search_plan) -> dict:
     }
 
 
+def _canonical(obj) -> str:
+    """Stable JSON: same content -> same bytes -> same hash, whatever the dict
+    insertion order was."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"))
+
+
 def config_sha256(config: dict) -> str:
     """Grouping key over effective_config: "which captures ran under the old
     band weights?" is then one GROUP BY, with the weights still readable."""
-    return hashlib.sha256(
-        json.dumps(config, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    return hashlib.sha256(_canonical(config).encode()).hexdigest()
+
+
+def dependencies_sha256(deps: dict) -> str:
+    """Same trick for the environment: "which captures ran under numpy 1.x?"."""
+    return hashlib.sha256(_canonical(deps).encode()).hexdigest()
 
 
 def build_run_info(args, dev: dict, cfg, search_plan) -> dict:
@@ -137,6 +205,7 @@ def build_run_info(args, dev: dict, cfg, search_plan) -> dict:
     `dev` is the Web-888's MSG config from SdrClient.read_config().
     """
     config = effective_config(args, cfg, search_plan)
+    deps = dependency_versions()
     maj, min_ = dev.get("version_maj"), dev.get("version_min")
     return {
         "kind": "collector",
@@ -146,6 +215,8 @@ def build_run_info(args, dev: dict, cfg, search_plan) -> dict:
         "collector_version": __version__,
         **git_state(),
         "python_version": platform.python_version(),
+        "dependencies_json": _canonical(deps),
+        "dependencies_sha256": dependencies_sha256(deps),
         "sdr_host": f"{args.host}:{args.port}",
         "sdr_firmware": f"{maj}.{min_}" if maj is not None else None,
         "sdr_rx_chans": (int(dev["rx_chans"]) if dev.get("rx_chans") is not None
