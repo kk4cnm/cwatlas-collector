@@ -1,1 +1,2 @@
+cwatlas_dash
 cwatlas_mcp

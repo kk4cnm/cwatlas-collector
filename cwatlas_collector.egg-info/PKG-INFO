@@ -11,3 +11,8 @@ Provides-Extra: dev
 Requires-Dist: pytest>=8; extra == "dev"
 Requires-Dist: pytest-asyncio>=0.23; extra == "dev"
 Requires-Dist: ruff>=0.6; extra == "dev"
+Provides-Extra: dash
+Requires-Dist: flask>=3; extra == "dash"
+Requires-Dist: opentelemetry-api>=1.26; extra == "dash"
+Requires-Dist: opentelemetry-sdk>=1.26; extra == "dash"
+Requires-Dist: opentelemetry-exporter-otlp-proto-http>=1.26; extra == "dash"
