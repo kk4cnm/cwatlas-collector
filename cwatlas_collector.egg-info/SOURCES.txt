@@ -19,13 +19,16 @@ cwatlas_mcp/capture.py
 cwatlas_mcp/catalog.py
 cwatlas_mcp/detector.py
 cwatlas_mcp/dsp.py
+cwatlas_mcp/migrations.py
 cwatlas_mcp/models.py
+cwatlas_mcp/provenance.py
 cwatlas_mcp/ptt.py
 cwatlas_mcp/runtime.py
 cwatlas_mcp/scheduler.py
 cwatlas_mcp/sdr_client.py
 cwatlas_mcp/server.py
 cwatlas_mcp/solar.py
+tests/test_capture_finalize.py
 tests/test_dash_app.py
 tests/test_dash_catalog.py
 tests/test_dash_catalog_live.py
@@ -34,3 +37,5 @@ tests/test_dash_package.py
 tests/test_dash_sdr.py
 tests/test_dash_solar.py
 tests/test_dash_system.py
+tests/test_migration.py
+tests/test_provenance.py
