@@ -1,8 +1,11 @@
 # CWAtlas Collector + MCP Sidecar — Design
 
-> Status: **draft skeleton**, 2026-06-21. Targets a Web-888 SDR (13 RX + 13 waterfall
-> channels, ~61.44 MHz front end) arriving ~June 2026. Numbers marked **[verify on hw]**
-> must be confirmed against the real device before relying on them.
+> Status: **pre-hardware design doc**, written 2026-06-21 against a spec sheet. The system
+> it describes has been in production since 2026-07-03 — the architecture is what got
+> built, and §3 is why. The *numbers* did not all survive contact with the device: this
+> doc assumes 13 RX channels, the real Web-888 reports **12** (11 usable for capture, 1
+> held by the scanner). Where a number is marked **[verify on hw]** and README.md states a
+> measured value, **the README wins** — it is written from the running system.
 
 ## 1. Goal
 
@@ -44,6 +47,29 @@ Three pillars under `~/cwatlas/`:
 ```
 
 ## 3. Two planes (the core idea)
+
+### Why this hardware — and why two planes are possible at all
+
+The predecessor prototype (FlexRadio 6600 + SmartSDR/VITA-49, archived at `/opt/CWAtlas`)
+was never a hardware *choice*. The 6600 was already on hand, so it was the fastest way to
+prove the idea end to end — control, IQ ingest, detection, storage — and it did exactly
+that. Its ceiling was **4 slices**, on a radio whose receivers are also wanted for
+operating.
+
+The Web-888 was selected on a survey of SDR receivers: a wide continuous tuning range
+(0–30 MHz), its own built-in Linux OS, capacity to monitor far more at once than the Flex,
+and a price that wasn't prohibitive.
+
+**But the pivot was architectural, not arithmetic.** With only a handful of receivers you
+are permanently choosing between *looking* and *recording*: every slice spent watching a
+band is a slice not capturing the CW it finds, and 4 slices cannot express the split at
+all. Given enough channels the two stop competing — some watch large portions of the bands
+continuously, others zero in on the CW that turns up and record it.
+
+So two planes is not an optimization applied to a many-channel radio. It is the design a
+many-channel radio makes *expressible*, and it is the whole reason for this hardware: it
+is what turns "monitor CW" into "collect far more of it than an operator's radio ever
+could." Everything below follows from that.
 
 **Search plane — waterfall channels.** Cheap and wide. One `/W/F` connection at
 `zoom=10` spans ~60 kHz at ~58 Hz/bin **[verify on hw: span = ui_srate / 2^zoom,

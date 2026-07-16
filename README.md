@@ -1,71 +1,195 @@
 # CWAtlas Collector + MCP Sidecar
 
-Off-device autonomous CW **search→capture** collector for the Web-888 SDR, plus an **MCP
-control plane** so an LLM agent can observe and steer it. Feeds raw narrowband IQ to the
-**MorseBase** training corpus.
+Autonomous **search→capture** collector that monitors amateur HF (+6m) CW around the
+clock and records **raw narrowband IQ** of every keyed signal it finds. The output is
+**MorseBase**: the training corpus for a CW-decoding model.
 
-See [DESIGN.md](DESIGN.md) for the full architecture. **This is a skeleton** — the
-structure, data model, scheduler policy, and MCP tool surface are real; the WS frame
-decode, CW detector, capture writer, and catalog DB are stubbed (`TODO[...]`) pending the
-hardware (~June 2026).
+The point is the corpus. Existing CW decoders fall apart on the things that make real
+on-air CW hard — low SNR, hand-keyed timing, QSB, drift, adjacent-signal splatter. You
+cannot train a model on that without a large, honestly-labeled body of raw IQ that
+contains it. This collector's job is to spend a year building that body of IQ, and to
+keep doing it unattended.
 
-## Layout
+**Status: in production** on `airig-01` since 2026-07-03, feeding a Web-888 SDR into
+`/mnt/md0/cwatlas/data`. As of 2026-07-16 the corpus holds **~34,600 captures / ~2,997
+IQ-hours / ~81 GB**. See [DESIGN.md](DESIGN.md) for the architecture and the reasoning
+behind it; this file covers what the system actually does today.
 
+## How it works
+
+Two planes, which is the core idea — and the reason for this hardware. With only a
+handful of receivers you are permanently choosing between *looking* and *recording*. Given
+enough channels the two stop competing, and you can watch large portions of the bands
+continuously while other channels zero in on the CW that turns up:
+
+- **Search plane** — waterfall (`/W/F`) connections, cheap and wide. They blanket the CW
+  "watering holes" (~400–600 kHz total across HF) and feed an Activity Map. Search is
+  never the bottleneck.
+- **Capture plane** — the RX (`/SND`) channels, scarce and narrow. Reserved entirely for
+  recording signals search already found: `mod=iq`, `compression=0`, passband ±250 Hz.
+  Capture follows detections; it never hunts.
+
+A **supervisor** loop sits between them and owns every channel assignment: it scores
+detections (keying confidence × SNR × solar band weight), assigns channels, and enforces
+dwell policy. It is deliberately LLM-free — collection has to survive the agent being
+absent, slow, or wrong.
+
+The **MCP sidecar** is a control plane only. An agent can observe (`get_activity_map`,
+`get_channel_roster`, `get_collection_stats`) and *nudge* (`prioritize_band`,
+`pin_frequency`, `request_deep_dwell`), but nudges are advisory — they go on a bus the
+supervisor reads. The agent never drives channels and IQ never flows through a tool call.
+
+### What the hardware actually gave us
+
+DESIGN.md was written against a spec sheet and guessed 13 RX channels. The real device
+(`Web888_v2026.609`) reports **12**, of which **11** are usable for capture (the scanner
+holds one). Two are reserved for deep-dwell, so steady state is **~9 concurrent
+captures** — the `ch=[cap cap ... idl idl]` line in the journal.
+
+## The corpus
+
+Each capture is a **SigMF pair** under `/mnt/md0/cwatlas/data/YYYY-MM-DD/`:
+
+```text
+20m_14015.73kHz_20260715T213231Z_ch2.sigmf-data   # ci16_le, headerless
+20m_14015.73kHz_20260715T213231Z_ch2.sigmf-meta   # JSON sidecar
 ```
-collector/
-  DESIGN.md                # architecture + roadmap (read this first)
-  pyproject.toml
-  cwatlas_mcp/
-    models.py              # Detection / ChannelState / TxEvent / Nudge dataclasses
-    sdr_client.py          # async AJAX + WebSocket client for the Web-888
-    scheduler.py           # Activity Map + Supervisor (the LLM-free brain) + ControlBus
-    server.py              # MCP sidecar: observe / nudge / TX tool families
-    runtime.py             # wires supervisor + search/PTT workers + MCP together
+
+IQ is decimated **12 kHz → 1.5 kHz inline** (`dsp.py`, DECIM=8) with the CW carrier
+landing at **+250 Hz baseband**. Files rotate every 600 s; a long dwell becomes several
+segments. Note this means captures **play as noise** in a media player — see
+[auditioning](#auditioning-captures).
+
+`catalog.db` (SQLite, WAL) is the index into that corpus — one row per capture, with the
+detection SNR and confidence that triggered it, GPS-disciplined start time, band, exact
+center frequency, and a `contaminated` flag. **`ended_utc IS NULL` means in flight;** a
+row still NULL long after the 600 s rotate window is an orphan, not live work.
+
+### Storage budget (answered, not estimated)
+
+DESIGN.md §7 called for a real budget calc before committing to a year. Measured over the
+first two weeks:
+
+| | per IQ-hour | note |
+| --- | --- | --- |
+| 12 kHz (early M1 captures, 611 rows) | 173 MB | pre-decimator |
+| 1.5 kHz (current, 33,990 rows) | 21.6 MB | **8× cheaper** |
+
+Steady state is **~5 GB/day → ~1.7 TB/year**, against 11.9 TB of array. A year-run fits
+comfortably; the "50 GB/day worst case" in DESIGN.md assumed no decimation and no
+activity gating. Cold-storage lifecycle (M5) is therefore not yet urgent.
+
+## Running it
+
+Two systemd units, both `enabled`:
+
+```bash
+systemctl status cwatlas-collector    # the collector itself
+systemctl status cwatlas-dash         # read-only status dashboard, :8828
 ```
 
-## Quickstart (dev, no hardware)
+Configuration is environment, set in the units (no hardcoded IPs in code):
+
+| Var | Purpose |
+| --- | --- |
+| `CWATLAS_SDR_HOST` | Web-888 address |
+| `CWATLAS_DATA_DIR` | corpus root |
+| `CWATLAS_LAT` / `CWATLAS_LON` | solar band weighting (day/night priorities) |
+| `CWATLAS_FLEX_HOST` | co-located FlexRadio, for TX hygiene |
+
+The collector runs `--no-mcp` under systemd: **the MCP tools are built but dormant in
+production**, because stdio MCP needs a client on stdin and systemd gives it `/dev/null`.
+Attach an agent by running the collector manually, or wait for the streamable-HTTP
+transport. This is why the dashboard reports `solar: live nudges require MCP`.
+
+The dashboard (`:8828`) is a read-only Flask sidecar — it opens the catalog `mode=ro` and
+touches the SDR only over its status endpoints. `/api/summary` is the whole payload.
+
+### Dev, without hardware
 
 ```bash
 cd ~/cwatlas/collector
 python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
-
-# Inspect the MCP tool surface (no collector attached):
-python -m cwatlas_mcp.server      # stdio; connect an MCP client/inspector
-
-# Full app (supervisor + search/PTT workers + MCP); needs a reachable SDR for real data:
-python -m cwatlas_mcp.runtime
+pip install -e ".[dev,dash]"
+python -m pytest tests/ -q
 ```
-
-Point it at your device by editing `SdrConfig` (host/port/password) in `runtime.py`, or
-wire it to env/config at M0.
 
 ## Auditioning captures
 
-Captures are SigMF: headerless complex int16 IQ at 1.5 kHz (`ci16_le`, carrier at
-~+250 Hz baseband) — they play as noise in a media player. Use
-`scripts/sigmf_listen.py` to render them as WAV at an audible sidetone pitch, and to
-pick strong captures from the catalog:
+Captures are 1.5 kHz complex int16 with the carrier at ~+250 Hz — noise to a media
+player. `scripts/sigmf_listen.py` renders them as WAV at an audible sidetone pitch and
+picks strong ones out of the catalog:
 
 ```bash
-.venv/bin/python scripts/sigmf_listen.py --top 20 --band 40m   # list strongest clean captures
-.venv/bin/python scripts/sigmf_listen.py --id 1902             # write <capture>.wav beside the data
+.venv/bin/python scripts/sigmf_listen.py --top 20 --band 40m   # strongest clean captures
+.venv/bin/python scripts/sigmf_listen.py --id 1902             # write <capture>.wav
 ```
 
 Details in [docs/sigmf_listen.md](docs/sigmf_listen.md).
 
 ## Design invariants (don't break these)
 
-- **MCP is control plane only** — never stream IQ/audio through tool calls.
-- **The supervisor is authoritative** — agent tools enqueue *nudges*, they don't drive
-  channels directly. Collection must survive the agent/MCP being down (Model B).
-- **TX front-end protection is hardware** (Flex amp-key → sequenced coax relay/limiter).
-  `notify_tx` / `ground_antenna` here are data-hygiene and secondary controls, not the
-  interlock.
-- **Capture raw IQ** (`mod=iq`, `compression=0`); on-device CW decoders are weak-label
-  helpers only, kept out of the capture path.
+- **Never churn connections.** Each capture worker opens its `/SND` session once and
+  **retunes in place**. A closed connection's channel is held ~1 min server-side; rapid
+  open/close starves the whole device. Learned twice on hardware.
+- **MCP is control plane only** — never stream IQ or audio through tool calls.
+- **The supervisor is authoritative** — agent tools enqueue nudges; they don't drive
+  channels. Collection must survive the agent being down.
+- **TX front-end protection is hardware** — the Flex amp-key → sequenced coax relay is the
+  interlock. `notify_tx` / `ground_antenna` are data hygiene and secondary controls, never
+  the thing standing between your amplifier and the SDR front end.
+- **Capture raw IQ.** On-device CW decoders are weak-label helpers only, kept out of the
+  capture path — the corpus must not inherit their mistakes.
+- **Signals must earn a channel**, not merely exist (`min_capture_score`). Closed-band junk
+  squatting on a slot for `release_timeout_s` is worse than an idle slot.
+- **A catalog row must always be closed.** If finalize is skipped, the row reads as
+  "capturing" forever — there is no later pass that cleans it up.
 
-## Milestones
+Several scheduler constants are scar tissue and are commented as such in
+`scheduler.py`; `release_timeout_s` shorter than the scan revisit period caused
+release/reassign ping-pong (154 rows in 3 min, most 0-sample), and `max_dwell_s` exists
+because one 14 dB signal held a channel for 265 minutes in the first overnight soak.
 
-M0 read-only proof · M1 single capture · M2 full 13-ch supervisor · M3 TX hygiene ·
-M4 agent nudges · M5 storage lifecycle. (Details in DESIGN.md §12.)
+## Layout
+
+```text
+cwatlas_mcp/
+  runtime.py     # wires supervisor + search/PTT workers + MCP together
+  scheduler.py   # Activity Map + supervisor (the LLM-free brain) + ControlBus
+  capture.py     # one persistent worker per RX channel; writes SigMF + catalog row
+  detector.py    # CW keying detection in the search plane
+  dsp.py         # 12k -> 1.5k decimation, carrier placement
+  catalog.py     # SQLite corpus index
+  sdr_client.py  # async AJAX + WebSocket client for the Web-888
+  ptt.py         # Flex TX ingest -> contamination marking
+  solar.py       # day/night band priority weighting
+  server.py      # MCP sidecar: observe / nudge / TX tool families
+cwatlas_dash/    # read-only Flask status dashboard (:8828) + OTLP telemetry
+scripts/         # sigmf_listen, backfill_orphans, hardware probes
+docs/            # session logs, design notes
+```
+
+## Roadmap
+
+M0 read-only proof · M1 single capture · M2 full supervisor · M3 TX hygiene — **done and
+in production**. M4 agent nudges is **built but dormant** (needs an MCP transport that
+survives systemd; see above). M5 storage lifecycle is **open**, and per the budget above,
+not yet pressing.
+
+Details in DESIGN.md §12 — though note DESIGN.md is a pre-hardware document: where it
+carries a **[verify on hw]** marker and this README states a measured number, trust this
+one.
+
+## Gotchas
+
+- **Don't mount anything on `/mnt`.** It shadows `/mnt/md0`, and the collector's data dir
+  goes with it. On 2026-07-15 this stranded 7 catalog rows for 18.5 h; captures in flight
+  kept writing through open fds but could not finalize. The finalize path is now hardened
+  and `scripts/backfill_orphans.py --apply` recovers rows stranded this way, but use
+  `/mnt/scratch` and skip the excitement. Other services on this host (signoz) broke the
+  same way at the same moment.
+- **The SDR has 12 channels and 12 user slots.** The dashboard's `users` count includes the
+  collector's own connections.
+- **`disk error` vs `stream error` in the journal** is a real distinction: the former is the
+  filesystem, the latter the radio. Chasing the SDR over what turned out to be a
+  `FileNotFoundError` cost an hour once.
