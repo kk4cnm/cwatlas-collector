@@ -124,7 +124,7 @@ First live observation: weights alone don't stop closed-band junk when
 channels are idle (9 daytime 160m carriers grabbed every slot). Fix:
 **`min_capture_score`** — a candidate must *earn* a channel under current
 weighting, not merely exist. Same signal: rejected at noon, eligible after
-dark. Station grid EM83vk (33.427 N, −82.208 W).
+dark. Station grid EM83vk.
 
 ## 6. First overnight soak (2026-07-01 17:52 → 2026-07-02 05:52 EDT)
 

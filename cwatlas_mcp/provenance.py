@@ -178,6 +178,11 @@ def effective_config(args, cfg, search_plan) -> dict:
             "no_mcp": args.no_mcp,
             "flex_ptt": bool(args.flex_host),   # a LAN IP isn't provenance
             "sdr": f"{args.host}:{args.port}",
+            # WHICH config file was in force. The values it produced are already
+            # resolved into this snapshot, so this is for the human asking
+            # "where did that come from?" — the archived Phase-1 schema had
+            # sessions.config_path for the same reason.
+            "config_path": getattr(args, "config", None),
         },
     }
 

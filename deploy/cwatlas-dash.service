@@ -10,10 +10,9 @@ Type=simple
 User=dnelms
 WorkingDirectory=/home/dnelms/cwatlas/collector
 Environment=PYTHONUNBUFFERED=1
-Environment=CWATLAS_SDR_HOST=192.168.2.46
-Environment=CWATLAS_DATA_DIR=/mnt/md0/cwatlas/data
-Environment=CWATLAS_LAT=33.427
-Environment=CWATLAS_LON=-82.208
+# Same config.toml the collector reads, so both agree about where the station
+# is. Not tracked — copy config.example.toml and edit it.
+Environment=CWATLAS_CONFIG=/home/dnelms/cwatlas/collector/config.toml
 ExecStart=/home/dnelms/cwatlas/collector/.venv/bin/python -m cwatlas_dash --host 0.0.0.0 --port 8828
 Restart=always
 RestartSec=5

@@ -16,7 +16,7 @@ DEV = {"rx_chans": 12, "version_maj": "2026", "version_min": "609"}
 
 
 def _args(**over):
-    base = dict(host="192.168.2.46", port=8073, rotate_s=600.0, lat=35.0, lon=-97.0,
+    base = dict(host="192.0.2.10", port=8073, rotate_s=600.0, lat=35.0, lon=-97.0,
                 trial=0.0, no_mcp=True, flex_host="")
     base.update(over)
     return argparse.Namespace(**base)
@@ -59,10 +59,10 @@ def test_config_captures_hardware_derived_and_cli_values():
 
 def test_flex_host_is_reduced_to_a_bool():
     """A LAN IP is not provenance."""
-    cfg = provenance.effective_config(_args(flex_host="192.168.2.99"), _cfg(),
+    cfg = provenance.effective_config(_args(flex_host="192.0.2.99"), _cfg(),
                                       SEARCH_PLAN)
     assert cfg["args"]["flex_ptt"] is True
-    assert "192.168.2.99" not in json.dumps(cfg)
+    assert "192.0.2.99" not in json.dumps(cfg)
 
 
 def test_unset_lat_lon_is_null_not_nan():

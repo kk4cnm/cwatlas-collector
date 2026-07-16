@@ -8,21 +8,23 @@ holes -> detector -> supervisor assigns idle RX channels -> capture workers writ
 SigMF + catalog rows. Channel budget: the scanner's W/F connection occupies one of
 the device's rx channels, so capture capacity = rx_chans - 1.
 
+Site details (SDR address, antenna location, data dir) come from config.toml —
+see config.example.toml and config.py. Nothing about one station belongs here.
+
 Usage:
     python -m cwatlas_mcp.runtime                     # collect forever + MCP (stdio)
     python -m cwatlas_mcp.runtime --trial 180         # 3-minute trial, no MCP
-    CWATLAS_SDR_HOST=192.168.2.46 overrides the SDR host.
+    python -m cwatlas_mcp.runtime --config /etc/cwatlas/config.toml
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
-import os
 import signal
 import sqlite3
 from pathlib import Path
 
-from . import capture
+from . import capture, config
 from .capture import channel_worker
 from .catalog import Catalog
 from .detector import detect_cw
@@ -117,23 +119,39 @@ class ChannelPool:
 
 
 async def main() -> None:
-    ap = argparse.ArgumentParser(description="CWAtlas collector")
-    ap.add_argument("--host", default=os.environ.get("CWATLAS_SDR_HOST",
-                                                     "192.168.2.46"))
-    ap.add_argument("--port", type=int, default=8073)
+    # Two-stage parse: --config has to be known before the other flags can take
+    # their defaults from it. Site details (LAN addresses, antenna location)
+    # live in config.toml, not in source — see config.py for the precedence.
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", default=None,
+                     help="site config TOML (default: $CWATLAS_CONFIG, else "
+                          "config.toml beside the package)")
+    pre_args, _ = pre.parse_known_args()
+    cfg_file = config.load(pre_args.config)
+
+    ap = argparse.ArgumentParser(description="CWAtlas collector", parents=[pre])
+    ap.add_argument("--host",
+                    default=config.pick(cfg_file, "sdr.host", "CWATLAS_SDR_HOST"))
+    ap.add_argument("--port", type=int,
+                    default=config.pick(cfg_file, "sdr.port", default=8073,
+                                        cast=int))
     ap.add_argument("--data-dir", type=Path,
-                    default=Path(os.environ.get("CWATLAS_DATA_DIR",
-                                                "~/cwatlas/data")).expanduser())
+                    default=config.pick(cfg_file, "paths.data_dir",
+                                        "CWATLAS_DATA_DIR", "~/cwatlas/data"))
     ap.add_argument("--trial", type=float, default=0.0,
                     help="run N seconds then exit (skips the MCP server)")
     ap.add_argument("--lat", type=float,
-                    default=float(os.environ.get("CWATLAS_LAT", "nan")))
+                    default=config.pick(cfg_file, "station.lat", "CWATLAS_LAT",
+                                        float("nan"), cast=float))
     ap.add_argument("--lon", type=float,
-                    default=float(os.environ.get("CWATLAS_LON", "nan")))
-    ap.add_argument("--rotate-s", type=float, default=600.0,
-                    help="max seconds per capture file segment")
+                    default=config.pick(cfg_file, "station.lon", "CWATLAS_LON",
+                                        float("nan"), cast=float))
+    ap.add_argument("--rotate-s", type=float,
+                    default=config.pick(cfg_file, "capture.rotate_s",
+                                        default=600.0, cast=float))
     ap.add_argument("--flex-host",
-                    default=os.environ.get("CWATLAS_FLEX_HOST", ""),
+                    default=config.pick(cfg_file, "tx.flex_host",
+                                        "CWATLAS_FLEX_HOST", ""),
                     help="Flex radio IP for PTT ingest; 'auto' = UDP discovery; "
                          "empty = TX hygiene disabled (hardware relay only)")
     ap.add_argument("--no-mcp", action="store_true",
@@ -141,6 +159,14 @@ async def main() -> None:
                          "stdio transport needs a client on stdin; under "
                          "systemd that's /dev/null and MCP would exit at once)")
     args = ap.parse_args()
+    args.config = cfg_file.get("_path")      # resolved path, for provenance
+
+    # No default for the SDR: guessing an address someone else owns is worse
+    # than saying so. (It used to default to the author's own LAN.)
+    if not args.host:
+        ap.error("no SDR host: set [sdr] host in config.toml (see "
+                 "config.example.toml), or CWATLAS_SDR_HOST, or --host")
+    args.data_dir = Path(args.data_dir).expanduser()
 
     if not args.trial and not args.no_mcp:
         # MCP-on-stdio owns stdout for JSON-RPC; every collector print() —

@@ -11,6 +11,7 @@ stubbed with TODOs so the structure compiles and the shape is reviewable.
 """
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass
 from typing import AsyncIterator, Optional
@@ -71,7 +72,6 @@ class SdrClient:
         return f"ws://{self.cfg.host}:{self.cfg.port}/{ts}/{stream}"
 
     async def _open_authed(self, stream: str):
-        import asyncio
 
         # serialize + pace connection opens (see OPEN_SPACING_S)
         if self._open_lock is None:
@@ -99,7 +99,6 @@ class SdrClient:
         bandwidth, adc_clk_nom. Use rx_chans from here at runtime — this unit
         reports 12, not the marketed 13.
         """
-        import asyncio
 
         cfg: dict = {}
         ws = await self._open_authed(stream)
@@ -158,7 +157,6 @@ class SdrClient:
         loss, waits `reconnect_backoff_s` (letting the server-side hold expire)
         and reconnects.
         """
-        import asyncio
 
         span = self.cfg.ui_srate_hz / (1 << zoom)
         while True:

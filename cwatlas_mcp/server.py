@@ -18,7 +18,7 @@ from mcp.server.fastmcp import FastMCP
 from .catalog import Catalog
 from .models import Nudge
 from .scheduler import CollectorState, ControlBus
-from .sdr_client import SdrClient, SdrConfig
+from .sdr_client import SdrClient
 
 mcp = FastMCP("cwatlas")
 

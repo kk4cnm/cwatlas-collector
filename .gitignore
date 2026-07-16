@@ -7,3 +7,11 @@ __pycache__/
 # git_dirty provenance flag on reinstall with no semantic change (see
 # docs/provenance.md); files stay on disk for the editable install.
 cwatlas_collector.egg-info/
+
+# This station: LAN addresses, antenna location, data paths. Never tracked.
+# See config.example.toml for the shape.
+config.toml
+
+# Build artifacts
+build/
+dist/

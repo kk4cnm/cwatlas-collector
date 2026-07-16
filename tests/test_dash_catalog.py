@@ -39,7 +39,10 @@ def test_totals(fixture_db):
 
 
 def test_db_is_opened_read_only(fixture_db):
-    import contextlib, pytest, sqlite3
+    import contextlib
+    import sqlite3
+
+    import pytest
     with contextlib.closing(sources._connect(fixture_db)) as db:
         with pytest.raises(sqlite3.OperationalError):
             db.execute("INSERT INTO captures (freq_hz, band, started_utc,"

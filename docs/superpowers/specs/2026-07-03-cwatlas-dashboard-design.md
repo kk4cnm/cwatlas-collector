@@ -76,7 +76,7 @@ Four independent sources, each individually failable:
    during implementation), the log panel degrades to an explanatory message.
 4. **Solar.** `cwatlas_mcp.solar.band_weights(lat, lon)` recomputed with the same
    coordinates as the collector unit file (read from `CWATLAS_LAT`/`CWATLAS_LON`
-   env, defaulting to the unit-file values 33.427 / −82.208). Solar baseline only;
+   env, defaulting to the unit-file values 35.0 / −97.0). Solar baseline only;
    live agent nudges are in-process state and shown as "n/a (MCP offline)".
 
 ## Routes — `app.py`

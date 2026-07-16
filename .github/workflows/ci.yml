@@ -1,0 +1,59 @@
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # the floor from pyproject's requires-python, and what production runs
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install
+        run: pip install -e ".[dev,dash]"
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Test
+        # No config.toml exists here, which is the point: the suite must not
+        # depend on one operator's station file. See tests/test_config.py.
+        run: pytest tests/ -q
+
+  package:
+    # The metadata is load-bearing: provenance reads the distribution's own
+    # requirements to decide which dependency versions to record, so a broken
+    # pyproject silently empties dependencies_json rather than failing loudly.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Build the wheel and sdist
+        run: |
+          pip install build twine
+          python -m build
+
+      - name: Check the metadata (license, deps) is well formed
+        run: twine check dist/*

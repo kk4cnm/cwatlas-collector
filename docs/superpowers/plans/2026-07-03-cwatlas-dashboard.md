@@ -19,7 +19,7 @@
 - Flask is an optional extra (`dash`); collector install must not gain a hard Flask dependency.
 - No CDN/network assets in the frontend — inline SVG charts, local static files only.
 - `/api/summary` never 500s because one data source is down — per-source `{"error": ...}` degradation.
-- Production paths on airig-01: data dir `/mnt/md0/cwatlas/data`, SDR `192.168.2.46:8073`, lat/lon `33.427 / -82.208`, collector unit `cwatlas-collector`.
+- Production paths on airig-01: data dir `/mnt/md0/cwatlas/data`, SDR `192.168.2.46:8073`, lat/lon (now `[station]` in config.toml), collector unit `cwatlas-collector`.
 - Commit messages end with `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`.
 
 ---
@@ -720,7 +720,7 @@ from cwatlas_dash import sources
 
 
 def test_solar_priorities_shape():
-    p = sources.solar_priorities(33.427, -82.208)
+    p = sources.solar_priorities(35.0, -97.0)
     assert isinstance(p["phase"], str) and p["phase"]
     assert p["weights"] and all(isinstance(w, float) for w in p["weights"].values())
     assert "20m" in p["weights"]
@@ -865,8 +865,8 @@ DEFAULTS = {
     "DATA_DIR": sources.DATA_DIR,
     "SDR_HOST": "192.168.2.46",
     "SDR_PORT": 8073,
-    "LAT": 33.427,
-    "LON": -82.208,
+    "LAT": 35.0,
+    "LON": -97.0,
     "UNIT": "cwatlas-collector",
 }
 
@@ -1262,9 +1262,9 @@ def main() -> None:
     ap.add_argument("--sdr-host",
                     default=os.environ.get("CWATLAS_SDR_HOST", "192.168.2.46"))
     ap.add_argument("--lat", type=float,
-                    default=float(os.environ.get("CWATLAS_LAT", "33.427")))
+                    default=float(os.environ.get("CWATLAS_LAT", "35.0")))
     ap.add_argument("--lon", type=float,
-                    default=float(os.environ.get("CWATLAS_LON", "-82.208")))
+                    default=float(os.environ.get("CWATLAS_LON", "-97.0")))
     args = ap.parse_args()
 
     app = create_app(DATA_DIR=args.data_dir, SDR_HOST=args.sdr_host,
@@ -1335,8 +1335,8 @@ WorkingDirectory=/home/dnelms/cwatlas/collector
 Environment=PYTHONUNBUFFERED=1
 Environment=CWATLAS_SDR_HOST=192.168.2.46
 Environment=CWATLAS_DATA_DIR=/mnt/md0/cwatlas/data
-Environment=CWATLAS_LAT=33.427
-Environment=CWATLAS_LON=-82.208
+Environment=CWATLAS_LAT=35.0
+Environment=CWATLAS_LON=-97.0
 ExecStart=/home/dnelms/cwatlas/collector/.venv/bin/python -m cwatlas_dash --host 0.0.0.0 --port 8828
 Restart=always
 RestartSec=5

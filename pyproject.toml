@@ -2,7 +2,22 @@
 name = "cwatlas-collector"
 version = "0.0.1"
 description = "Autonomous CW search→capture collector + MCP control plane for the Web-888 SDR (CWAtlas / MorseBase)"
+readme = "README.md"
 requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Daniel Nelms", email = "xretsalb@gmail.com" }]
+keywords = ["sdr", "morse", "cw", "ham-radio", "amateur-radio", "hf",
+            "signal-processing", "sigmf", "dataset", "mcp"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Communications :: Ham Radio",
+    "Topic :: Scientific/Engineering",
+]
 dependencies = [
     "mcp>=1.2",          # MCP Python SDK (FastMCP)
     "httpx>=0.27",       # AJAX info plane
@@ -23,7 +38,9 @@ dash = [
 cwatlas-collector = "cwatlas_mcp.runtime:main"
 
 [build-system]
-requires = ["setuptools>=68"]
+# >=77 for PEP 639 (`license` as an SPDX string + `license-files`); older
+# setuptools rejects both.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]

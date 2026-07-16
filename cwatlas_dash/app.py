@@ -12,12 +12,16 @@ from flask import Flask, g, jsonify, render_template, request
 from . import sources
 from .telemetry import get_telemetry, request_start_time
 
+# Site details come from config.toml / env / CLI (see cwatlas_mcp.config and
+# config.example.toml) — never from source. A dashboard that ships one
+# operator's LAN address and antenna location as its defaults is a dashboard
+# that quietly points at the wrong station for everyone else.
 DEFAULTS = {
     "DATA_DIR": sources.DATA_DIR,
-    "SDR_HOST": "192.168.2.46",
+    "SDR_HOST": None,
     "SDR_PORT": 8073,
-    "LAT": 33.427,
-    "LON": -82.208,
+    "LAT": float("nan"),      # NaN -> solar panel reports "not configured"
+    "LON": float("nan"),
     "UNIT": "cwatlas-collector",
 }
 

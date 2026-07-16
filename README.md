@@ -1,5 +1,8 @@
 # CWAtlas Collector + MCP Sidecar
 
+[![ci](https://github.com/kk4cnm/cwatlas-collector/actions/workflows/ci.yml/badge.svg)](https://github.com/kk4cnm/cwatlas-collector/actions/workflows/ci.yml)
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 Autonomous **search→capture** collector that monitors amateur HF (+6m) CW around the
 clock and records **raw narrowband IQ** of every keyed signal it finds. The output is
 **MorseBase**: the training corpus for a CW-decoding model.
@@ -95,14 +98,28 @@ systemctl status cwatlas-collector    # the collector itself
 systemctl status cwatlas-dash         # read-only status dashboard, :8828
 ```
 
-Configuration is environment, set in the units (no hardcoded IPs in code):
+Configuration is a **TOML file describing your station** — nothing about one
+operator's rig lives in source:
 
-| Var | Purpose |
+```bash
+cp config.example.toml config.toml   # then edit; config.toml is gitignored
+```
+
+| Section | Purpose |
 | --- | --- |
-| `CWATLAS_SDR_HOST` | Web-888 address |
-| `CWATLAS_DATA_DIR` | corpus root |
-| `CWATLAS_LAT` / `CWATLAS_LON` | solar band weighting (day/night priorities) |
-| `CWATLAS_FLEX_HOST` | co-located FlexRadio, for TX hygiene |
+| `[sdr] host/port` | Web-888 address. **No default** — the collector won't guess |
+| `[paths] data_dir` | corpus root |
+| `[station] lat/lon` | solar band weighting; omit for neutral priorities |
+| `[tx] flex_host` | co-located FlexRadio, for TX hygiene (`""` disables) |
+| `[capture] rotate_s` | max seconds per file segment |
+
+Precedence is **CLI > environment > config.toml > built-in default**; the env
+names (`CWATLAS_SDR_HOST`, `CWATLAS_DATA_DIR`, `CWATLAS_LAT`/`LON`,
+`CWATLAS_FLEX_HOST`) still work and still win, so an existing env-driven
+deployment keeps running unchanged. The systemd units point at the file with
+`CWATLAS_CONFIG=`. A `--config`/`CWATLAS_CONFIG` path that doesn't exist is an
+error rather than a silent fallback: believing your settings are loaded when
+they aren't means mis-weighted bands all night, looking like nothing is wrong.
 
 The collector runs `--no-mcp` under systemd: **the MCP tools are built but dormant in
 production**, because stdio MCP needs a client on stdin and systemd gives it `/dev/null`.
@@ -165,6 +182,7 @@ because one 14 dB signal held a channel for 265 minutes in the first overnight s
 
 ```text
 cwatlas_mcp/
+  config.py      # site config: config.toml < env < CLI
   runtime.py     # wires supervisor + search/PTT workers + MCP together
   scheduler.py   # Activity Map + supervisor (the LLM-free brain) + ControlBus
   capture.py     # one persistent worker per RX channel; writes SigMF + catalog row
@@ -192,6 +210,14 @@ not yet pressing.
 Details in DESIGN.md §12 — though note DESIGN.md is a pre-hardware document: where it
 carries a **[verify on hw]** marker and this README states a measured number, trust this
 one.
+
+## License
+
+The **collector software** is Apache-2.0 (see [LICENSE](LICENSE) and
+[NOTICE](NOTICE)) — Copyright 2026 Daniel Nelms (KK4CNM).
+
+**MorseBase — the corpus the collector produces — is a separate work and is not
+covered by that license.** Its terms are still to be decided.
 
 ## Gotchas
 

@@ -1,6 +1,5 @@
 [Unit]
 Description=CWAtlas CW collector (Web-888 -> MorseBase corpus)
-# LAN targets: SDR 192.168.2.46:8073, Flex 192.168.2.80:4992
 After=network-online.target
 Wants=network-online.target
 
@@ -9,11 +8,9 @@ Type=simple
 User=dnelms
 WorkingDirectory=/home/dnelms/cwatlas/collector
 Environment=PYTHONUNBUFFERED=1
-Environment=CWATLAS_SDR_HOST=192.168.2.46
-Environment=CWATLAS_DATA_DIR=/mnt/md0/cwatlas/data
-Environment=CWATLAS_LAT=33.427
-Environment=CWATLAS_LON=-82.208
-Environment=CWATLAS_FLEX_HOST=192.168.2.80
+# Station details — SDR address, antenna location, data dir — live in
+# config.toml, which is NOT tracked. Copy config.example.toml and edit it.
+Environment=CWATLAS_CONFIG=/home/dnelms/cwatlas/collector/config.toml
 # --no-mcp: stdio MCP needs a client on stdin; under systemd that's /dev/null.
 # Attach an agent by running the collector manually, or wait for the
 # streamable-HTTP transport milestone.

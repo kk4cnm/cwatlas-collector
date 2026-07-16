@@ -29,7 +29,8 @@ def test_sdr_snapshot_caches(monkeypatch):
                         lambda h, p: calls.append(1) or {"status": {}, "adc": {}})
     sources._SDR_CACHE.clear()
     clock = [1000.0]
-    now = lambda: clock[0]
+    def now():
+        return clock[0]
 
     sources.sdr_snapshot("h1", ttl_s=10.0, now=now)
     sources.sdr_snapshot("h1", ttl_s=10.0, now=now)      # within ttl: cached

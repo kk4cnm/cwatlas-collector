@@ -1,0 +1,41 @@
+# CWAtlas collector — site configuration.
+#
+#   cp config.example.toml config.toml   and edit.
+#
+# config.toml is gitignored: it describes YOUR station, and none of it belongs
+# in a public repo. Every value here can also come from the environment (the
+# systemd units in deploy/ do it that way), and the environment wins over this
+# file. A CLI flag wins over both.
+
+[sdr]
+# The Web-888's address on your LAN. No default — the collector will not guess.
+# env: CWATLAS_SDR_HOST / (port has no env; use --port)
+host = "192.0.2.10"        # <- change me (192.0.2.0/24 is the RFC 5737 doc range)
+port = 8073
+
+[paths]
+# Where the IQ corpus and catalog.db go. Expect ~5 GB/day at steady state.
+# env: CWATLAS_DATA_DIR
+data_dir = "~/cwatlas/data"
+
+[station]
+# Antenna location, for solar band weighting (high bands by day, low bands after
+# dark, gray-line boost at twilight). Decimal degrees, north/east positive.
+# Omit both to run with neutral band priorities.
+# There is deliberately no default: a wrong location silently mis-weights every
+# band, all night, and looks like nothing is wrong.
+# env: CWATLAS_LAT / CWATLAS_LON
+lat = 0.0                  # <- change me
+lon = 0.0                  # <- change me
+
+[tx]
+# Co-located transmitter for TX hygiene (contamination marking). This is
+# BOOKKEEPING ONLY — the hardware antenna-disconnect relay is what actually
+# protects the SDR front end. Leave empty to disable (relay-only operation).
+# "auto" discovers a FlexRadio over UDP.
+# env: CWATLAS_FLEX_HOST
+flex_host = ""
+
+[capture]
+# Max seconds per capture file segment; a long dwell becomes several segments.
+rotate_s = 600.0
