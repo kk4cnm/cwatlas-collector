@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import os
 import signal
+import sqlite3
 from pathlib import Path
 
 from . import capture
@@ -26,6 +27,7 @@ from .capture import channel_worker
 from .catalog import Catalog
 from .detector import detect_cw
 from .models import Detection
+from .provenance import build_run_info
 from .scheduler import CollectorState, ControlBus, SchedulerConfig, Supervisor
 from .sdr_client import SdrClient, SdrConfig
 
@@ -161,8 +163,13 @@ async def main() -> None:
 
     state = CollectorState()
     bus = ControlBus()
-    catalog = Catalog(args.data_dir / "catalog.db")
+    # cfg before the catalog: begin_run snapshots it (it carries the hw-derived
+    # channel count), and every capture this process makes points at that run.
     cfg = SchedulerConfig(n_rx_channels=rx_chans - 1)
+    catalog = Catalog(args.data_dir / "catalog.db")
+    run_id = catalog.begin_run(build_run_info(args, dev, cfg, SEARCH_PLAN))
+    print(f"[runtime] run {run_id}: recorded firmware, git state and effective "
+          f"config; captures from here carry run_id={run_id}")
     # Supervisor must exist before the pool (it populates state.channels), but the
     # pool must exist before ticks assign — construct in this order:
     sup = Supervisor(cfg, state, bus, catalog=catalog)
@@ -226,6 +233,14 @@ async def main() -> None:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         await pool.shutdown()   # workers finalize in-flight files/rows, then exit
+        # Guarded: an end_run failure must not skip catalog.close()/sdr.aclose()
+        # below. A run left open reads as "did not exit cleanly", which is a
+        # smaller lie than a leaked SDR connection (whose channel is then held
+        # ~1 min server-side).
+        try:
+            catalog.end_run()
+        except sqlite3.Error as exc:
+            print(f"[runtime] end_run failed ({exc!r}); run left open")
         print(f"[runtime] catalog: {catalog.stats()}")
         catalog.close()
         await sdr.aclose()

@@ -3,12 +3,21 @@
 One row per capture session (one channel dwell on one frequency). The IQ itself
 lives in SigMF file pairs on disk; the catalog is how anything finds it again.
 sqlite3 + WAL is plenty at collection rates (a handful of rows/minute, tops).
+
+Also holds provenance: a `runs` row per collector process describing what was
+running (see provenance.py), which every capture points at via run_id. See
+docs/provenance.md.
+
+SCHEMA below is the FROZEN v0 baseline — never edit it. Schema changes go in
+migrations.py; see the note there.
 """
 from __future__ import annotations
 
 import sqlite3
 import time
 from pathlib import Path
+
+from .migrations import migrate
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS captures (
@@ -32,19 +41,60 @@ CREATE INDEX IF NOT EXISTS idx_captures_band_time ON captures(band, started_utc)
 
 
 class Catalog:
+    # NB foreign_keys is left OFF (sqlite's default). The REFERENCES clauses in
+    # the schema are documentation. Turning enforcement on would mean a bad
+    # run_id fails every start_capture INSERT — a provenance bug taking
+    # collection down with it, which is exactly backwards.
+
     def __init__(self, db_path: Path):
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(db_path)
         self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.executescript(SCHEMA)
+        self._db.executescript(SCHEMA)      # v0 baseline; frozen, see migrations.py
         self._db.commit()
+        migrate(self._db)
+        # Set by begin_run(). Stays None for a Catalog opened without one (tests,
+        # scripts, the dash): captures then record run_id NULL, which is correct —
+        # no run was declared, so there is nothing to point at.
+        self._run_id: int | None = None
+
+    # ---- provenance ---------------------------------------------------------
+
+    def begin_run(self, info: dict) -> int:
+        """Record what's running (see provenance.build_run_info) and stamp every
+        capture from here on with it.
+
+        Deliberately unguarded: this writes to the same DB start_capture needs,
+        so if it can't INSERT the collector is not going to collect anything
+        either. Failing loudly at startup beats discovering it 18 hours later.
+        """
+        cols = ", ".join(info)
+        cur = self._db.execute(
+            f"INSERT INTO runs ({cols}) VALUES ({', '.join('?' * len(info))})",
+            tuple(info.values()))
+        self._db.commit()
+        self._run_id = cur.lastrowid
+        return self._run_id
+
+    def end_run(self) -> None:
+        """Close the current run. Leaving ended_utc NULL is meaningful — it says
+        the process died without unwinding (SIGKILL, OOM, power) — so this is
+        only ever called from a clean shutdown."""
+        if self._run_id is None:
+            return
+        self._db.execute("UPDATE runs SET ended_utc=? WHERE id=?",
+                         (time.time(), self._run_id))
+        self._db.commit()
+
+    # ---- captures -----------------------------------------------------------
 
     def start_capture(self, *, freq_hz: float, band: str, srate_hz: int,
                       path: str, strength_db: float, keyed_conf: float) -> int:
         cur = self._db.execute(
             "INSERT INTO captures (freq_hz, band, started_utc, srate_hz, path,"
-            " strength_db, keyed_conf) VALUES (?,?,?,?,?,?,?)",
-            (freq_hz, band, time.time(), srate_hz, path, strength_db, keyed_conf))
+            " strength_db, keyed_conf, run_id) VALUES (?,?,?,?,?,?,?,?)",
+            (freq_hz, band, time.time(), srate_hz, path, strength_db, keyed_conf,
+             self._run_id))
         self._db.commit()
         return cur.lastrowid
 

@@ -65,6 +65,13 @@ detection SNR and confidence that triggered it, GPS-disciplined start time, band
 center frequency, and a `contaminated` flag. **`ended_utc IS NULL` means in flight;** a
 row still NULL long after the 600 s rotate window is an orphan, not live work.
 
+Each capture also carries a `run_id` into the `runs` table: what was running when it was
+made — receiver firmware, collector git commit (and whether the tree was dirty), and the
+effective config, including the band weights and detector thresholds in force at the
+time. Captures made before 2026-07-16 predate this and are adopted by an explicit
+`kind='synthetic'` run whose NULLs mean *unrecorded*, not *failed to record*. See
+[docs/provenance.md](docs/provenance.md).
+
 ### Storage budget (answered, not estimated)
 
 DESIGN.md §7 called for a real budget calc before committing to a year. Measured over the
@@ -144,6 +151,10 @@ Details in [docs/sigmf_listen.md](docs/sigmf_listen.md).
   squatting on a slot for `release_timeout_s` is worse than an idle slot.
 - **A catalog row must always be closed.** If finalize is skipped, the row reads as
   "capturing" forever — there is no later pass that cleans it up.
+- **Provenance never stops collection.** Event writes are wrapped and can only print;
+  a failure to record history must not cost a capture. Corollary: the `contaminated`
+  flag commits *before* its event, never in one transaction — rolling back would undo
+  the flag, and hygiene beats provenance. See [docs/provenance.md](docs/provenance.md).
 
 Several scheduler constants are scar tissue and are commented as such in
 `scheduler.py`; `release_timeout_s` shorter than the scan revisit period caused
@@ -159,7 +170,9 @@ cwatlas_mcp/
   capture.py     # one persistent worker per RX channel; writes SigMF + catalog row
   detector.py    # CW keying detection in the search plane
   dsp.py         # 12k -> 1.5k decimation, carrier placement
-  catalog.py     # SQLite corpus index
+  catalog.py     # SQLite corpus index (+ runs / capture_events provenance)
+  migrations.py  # schema evolution, keyed on PRAGMA user_version
+  provenance.py  # what was running: firmware, git state, effective config
   sdr_client.py  # async AJAX + WebSocket client for the Web-888
   ptt.py         # Flex TX ingest -> contamination marking
   solar.py       # day/night band priority weighting
