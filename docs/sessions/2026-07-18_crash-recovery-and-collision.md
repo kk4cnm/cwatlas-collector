@@ -155,13 +155,43 @@ against the unpatched code first:
 
 Full suite: 93 passed.
 
-## 5. Open question
+## 5. The 172 historical pairs: flagged, not deleted
 
-The 172 historical pairs are still in the catalog. The truncated row in each
-pair is a phantom — it points at its partner's IQ. Options are to leave them as
-history, flag them via the event log, or delete them. Deleting catalog rows is
-destructive and this is an instrument's record, so it's Daniel's call, not a
-cleanup to do unilaterally. Deferred.
+Daniel's call, and the right one: **flag them and leave them.** A row that was
+really written really happened, and a catalog that quietly loses rows is tidier
+and less true. Deleting would also have destroyed the only evidence of the bug's
+16-day reach.
+
+`scripts/flag_truncated_collisions.py` appends a `truncated_by_collision` event
+per victim and **modifies nothing in `captures`** — the row keeps saying exactly
+what it always said, and the event log carries the correction. Each event
+records that row's own evidence:
+
+```json
+{"claimed_n_samples": 192, "file_n_samples": 900032,
+ "file_owner_capture_id": 985, "fixed_in": "e2c495f",
+ "reason": "file overwritten by a same-second filename collision; ..."}
+```
+
+The victim is chosen from **file evidence, not timestamp order** — a row is only
+flagged if the file size matches its partner's `n_samples` and not its own.
+Ambiguous groups are skipped and reported rather than guessed. Verified across
+all 172 before applying: 172/172 matched the signature, zero counterexamples,
+zero missing files.
+
+Consumers should exclude flagged rows:
+
+```sql
+SELECT * FROM captures c WHERE NOT EXISTS (
+  SELECT 1 FROM capture_events e
+  WHERE e.capture_id = c.id AND e.event_type = 'truncated_by_collision')
+```
+
+**Residual hazard, stated plainly:** that exclusion is opt-in. A consumer reading
+`captures` naively still gets 172 rows whose `path` resolves to a partner's IQ.
+The flag makes the problem *knowable*, not *impossible*. If the corpus ever
+grows a consumer that can't be trusted to join against the event log, this
+should become a schema column instead.
 
 ## 6. What this session was actually about
 
