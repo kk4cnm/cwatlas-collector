@@ -89,6 +89,18 @@ async def _write_capture(session: IqSession, cs: ChannelState,
     day_dir = data_dir / time.strftime("%Y-%m-%d", time.gmtime(started))
     day_dir.mkdir(parents=True, exist_ok=True)
     base = day_dir / name
+    # The name is second-granular, so two captures on one channel at one
+    # frequency inside the same second collide — a rotate handoff racing a
+    # supervisor reassign does exactly that. The scheduler no longer causes it,
+    # but a name collision must never be able to destroy IQ: "wb" would
+    # truncate the earlier file and leave its catalog row pointing at another
+    # capture's samples. Uniquify instead. (2026-07-18; 171 groups in the corpus.)
+    if Path(f"{base}.sigmf-data").exists():
+        n = 2
+        while Path(f"{day_dir / f'{name}_{n}'}.sigmf-data").exists():
+            n += 1
+        base = day_dir / f"{name}_{n}"
+        print(f"[capture ch{cs.ch}] name collision on {name}; writing {base.name}")
 
     cap_id = catalog.start_capture(
         freq_hz=det.freq_hz, band=det.band, srate_hz=FS_OUT,
@@ -104,7 +116,10 @@ async def _write_capture(session: IqSession, cs: ChannelState,
     reason = "inbox"
     last_ka = time.time()
     try:
-        with open(f"{base}.sigmf-data", "wb") as fd:
+        # "xb", not "wb": after the uniquify above this can't collide, so if it
+        # ever does that's a bug worth one channel's backoff to hear about —
+        # silent truncation is what hid this one for 16 days.
+        with open(f"{base}.sigmf-data", "xb") as fd:
             while True:
                 try:
                     nxt = inbox.get_nowait()   # reassignment/release/shutdown?

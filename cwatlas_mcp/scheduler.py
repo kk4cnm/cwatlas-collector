@@ -280,6 +280,14 @@ class Supervisor:
                 break
             if det.freq_hz in served:
                 continue
+            # Re-check the cooldown HERE, not just in _score_candidates: step 1
+            # above may have just stamped one, and `desired` was scored before
+            # that. Without this the max-dwell hog guard is a no-op — the signal
+            # it evicts wins the same slot back in the same tick, which is how
+            # 171 same-second filename collisions got into the corpus (2026-07-18;
+            # see docs/sessions/2026-07-18_crash-recovery-and-collision.md).
+            if time.time() < det.cooldown_until:
+                continue
             ch = self._first_idle()
             if ch is None:
                 break
